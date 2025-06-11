@@ -26,12 +26,12 @@ BASE_META_DATA = Base(
     literal_imports=[
         LiteralImport(
             "risclog.sqlalchemy.model",
-            "PortalObjectBase, declarative_base, class_registry",
+            "ObjectBase, declarative_base, class_registry",
         )
     ],
     declarations=[
         "PortalObject = declarative_base("
-        "PortalObjectBase, class_registry=class_registry)"
+        "ObjectBase, class_registry=class_registry)"
     ],
     metadata_ref="PortalObject.metadata",
 )
