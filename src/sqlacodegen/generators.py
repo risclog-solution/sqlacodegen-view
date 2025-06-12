@@ -380,7 +380,9 @@ class TablesGenerator(CodeGenerator):
         for index in sorted(table.indexes, key=lambda i: cast(str, i.name)):
             # One-column indexes should be rendered as index=True on columns
             if len(index.columns) > 1 or not uses_default_name(index):
-                args.append(self.render_index(index))
+                idx_code = self.render_index(index)
+                if idx_code is not None:
+                    args.append(idx_code)
 
         if table.schema:
             kwargs["schema"] = repr(table.schema)
@@ -1177,7 +1179,9 @@ class DeclarativeGenerator(TablesGenerator):
         # Render indexes
         for index in sorted(table.indexes, key=lambda i: cast(str, i.name)):
             if len(index.columns) > 1 or not uses_default_name(index):
-                args.append(self.render_index(index))
+                idx_code = self.render_index(index)
+                if idx_code is not None:
+                    args.append(idx_code)
 
         if table.schema:
             kwargs["schema"] = table.schema

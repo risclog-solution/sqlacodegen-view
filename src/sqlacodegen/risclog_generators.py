@@ -7,6 +7,7 @@ from sqlacodegen.generators import (
     DeclarativeGenerator,
     LiteralImport,
     TablesGenerator,
+    render_callable,
 )
 from sqlacodegen.models import Model, ModelClass
 
@@ -43,6 +44,17 @@ def clx_generate_base(self: "TablesGenerator") -> None:
 
 TablesGenerator.generate_base = clx_generate_base  # type: ignore[method-assign]
 
+def clx_render_index(self:"TablesGenerator", index):
+    extra_args = [repr(col.name) for col in index.columns]
+    if not extra_args:
+        print(f"# WARNING: Skipped index '{index.name}' on table '{index.table.name}' because it has no columns.")
+        return None
+    kwargs = {}
+    if index.unique:
+        kwargs["unique"] = True
+    return render_callable("Index", repr(index.name), *extra_args, kwargs=kwargs)
+
+TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
 
 class DeclarativeGeneratorWithViews(DeclarativeGenerator):
     def generate_base(self) -> None:
@@ -68,9 +80,9 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             if table.name in schema_views:
                 views_exist = True
                 view_def = inspector.get_view_definition(table.name, schema)
-                classname = (
-                    "".join(x.capitalize() for x in table.name.split("_")) + "View"
-                )
+                classname = "".join(x.capitalize() for x in table.name.split("_"))
+                if not classname.lower().endswith("view"):
+                    classname += "View"
                 code = VIEW_CLASS_TEMPLATE.format(
                     classname=classname,
                     table_name=table.name,
