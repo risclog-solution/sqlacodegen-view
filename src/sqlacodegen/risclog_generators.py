@@ -244,7 +244,7 @@ def clx_render_index(self: "TablesGenerator", index: Index) -> str:
         )
         return ""
 
-    kwargs = {}
+    kwargs: dict[str, Any] = {}
     if index.unique:
         kwargs["unique"] = True
 
