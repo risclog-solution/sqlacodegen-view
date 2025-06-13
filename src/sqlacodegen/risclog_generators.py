@@ -251,7 +251,11 @@ def clx_render_index(self: "TablesGenerator", index: Index) -> str:
     if "postgresql" in index.dialect_options:
         dialect_opts = index.dialect_options["postgresql"]
         if "using" in dialect_opts:
-            kwargs["postgresql_using"] = dialect_opts["using"]
+            kwargs["postgresql_using"] = (
+                repr(dialect_opts["using"])
+                if isinstance(dialect_opts["using"], str)
+                else dialect_opts["using"]
+            )
 
     return render_callable("Index", repr(index.name), *extra_args, kwargs=kwargs)
 
