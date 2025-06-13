@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Column, Index, inspect, types as satypes
+from sqlalchemy import Column, Index, inspect
+from sqlalchemy import types as satypes
 
 from sqlacodegen.generators import (
     Base,
@@ -41,7 +42,11 @@ def sa_type_from_column(col: Column[Any]) -> str:
     if isinstance(t, (satypes.Enum,)):
         enum_class = getattr(t, "enum_class", None)
         if enum_class is not None:
-            enum_name = enum_class.__name__ if hasattr(enum_class, "__name__") else str(enum_class)
+            enum_name = (
+                enum_class.__name__
+                if hasattr(enum_class, "__name__")
+                else str(enum_class)
+            )
             return f"Enum({enum_name})"
         if hasattr(t, "enums"):
             return f"Enum({', '.join(repr(e) for e in t.enums)})"
@@ -49,7 +54,16 @@ def sa_type_from_column(col: Column[Any]) -> str:
 
     if isinstance(t, (satypes.FLOAT, satypes.Float, satypes.REAL)):
         return "Float"
-    if isinstance(t, (satypes.INT, satypes.INTEGER, satypes.Integer, satypes.SMALLINT, satypes.SmallInteger)):
+    if isinstance(
+        t,
+        (
+            satypes.INT,
+            satypes.INTEGER,
+            satypes.Integer,
+            satypes.SMALLINT,
+            satypes.SmallInteger,
+        ),
+    ):
         return "Integer"
     if isinstance(t, (satypes.Interval,)):
         return "Interval"
@@ -57,7 +71,18 @@ def sa_type_from_column(col: Column[Any]) -> str:
         return "JSON"
     if isinstance(t, (satypes.LargeBinary,)):
         return "LargeBinary"
-    if isinstance(t, (satypes.NVARCHAR, satypes.VARCHAR, satypes.String, satypes.Text, satypes.TEXT, satypes.Unicode, satypes.UnicodeText)):
+    if isinstance(
+        t,
+        (
+            satypes.NVARCHAR,
+            satypes.VARCHAR,
+            satypes.String,
+            satypes.Text,
+            satypes.TEXT,
+            satypes.Unicode,
+            satypes.UnicodeText,
+        ),
+    ):
         return "String"
     if isinstance(t, (satypes.PickleType,)):
         return "PickleType"
@@ -72,15 +97,27 @@ def sa_type_from_column(col: Column[Any]) -> str:
     if isinstance(t, (satypes.ARRAY,)):
         item_type = getattr(t, "item_type", None)
         if item_type:
-            if isinstance(item_type, (satypes.Integer, satypes.INT, satypes.SMALLINT, satypes.BigInteger)):
+            if isinstance(
+                item_type,
+                (satypes.Integer, satypes.INT, satypes.SMALLINT, satypes.BigInteger),
+            ):
                 return "ARRAY(Integer)"
             if isinstance(item_type, (satypes.String, satypes.Text, satypes.VARCHAR)):
                 return "ARRAY(String)"
-            if isinstance(item_type, (satypes.Numeric, satypes.DECIMAL, satypes.Float, satypes.DOUBLE, satypes.REAL)):
+            if isinstance(
+                item_type,
+                (
+                    satypes.Numeric,
+                    satypes.DECIMAL,
+                    satypes.Float,
+                    satypes.DOUBLE,
+                    satypes.REAL,
+                ),
+            ):
                 return "ARRAY(Numeric)"
             if isinstance(item_type, (satypes.Boolean,)):
                 return "ARRAY(Boolean)"
-        return "ARRAY(String)" 
+        return "ARRAY(String)"
 
     t_str = str(type(t)).upper() + " " + str(t).upper()
     mapping = {
@@ -118,14 +155,13 @@ def sa_type_from_column(col: Column[Any]) -> str:
         "UUID": "Uuid",
         "VARBINARY": "LargeBinary",
         "VARCHAR": "String",
-        "ARRAY": "ARRAY(String)", 
+        "ARRAY": "ARRAY(String)",
     }
     for key, value in mapping.items():
         if key in t_str:
             return value
 
     return "String"
-
 
 
 VIEW_CLASS_TEMPLATE = """\
@@ -227,7 +263,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         )
         return result
 
-
     def render_models(self, models: list[Model]) -> str:
         rendered: list[str] = []
         inspector = inspect(self.bind)
@@ -263,7 +298,15 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             # "Uuid": ("sqlalchemy.dialects.postgresql", "UUID as SA_UUID"),
         }
 
-        string_types = ["CHAR", "NCHAR", "NVARCHAR", "UNICODE", "UNICODETEXT", "TEXT", "VARCHAR"]
+        string_types = [
+            "CHAR",
+            "NCHAR",
+            "NVARCHAR",
+            "UNICODE",
+            "UNICODETEXT",
+            "TEXT",
+            "VARCHAR",
+        ]
         for t in string_types:
             type_imports[t] = ("sqlalchemy", "String")
 
@@ -318,6 +361,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             if typ in type_imports:
                 module, name = type_imports[typ]
                 self.add_literal_import(module, name)
-    
+
         self.add_literal_import("sqlalchemy", "text")
         return "\n\n".join(rendered)
