@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Column, Index, inspect, text
+from sqlalchemy import Column, Index, inspect, text, types
 from sqlalchemy import types as satypes
 from sqlalchemy.engine import Connection, Engine
 
@@ -176,16 +176,15 @@ class {classname}(PortalObject):
     _sql_view_definition = text(\"\"\"{view_def}\"\"\")
 """
 
+
 BASE_META_DATA = Base(
     literal_imports=[
         LiteralImport(
-            "risclog.sqlalchemy.model",
-            "ObjectBase, declarative_base, class_registry",
+            "risclog.claimxdb.clx.clx_models_base",
+            "PortalObject",
         )
     ],
-    declarations=[
-        "PortalObject = declarative_base(ObjectBase, class_registry=class_registry)"
-    ],
+    declarations=[],
     metadata_ref="PortalObject.metadata",
 )
 
@@ -225,39 +224,63 @@ def get_expression_indexes(
 
 
 def clx_render_index(self: "TablesGenerator", index: Index) -> str:
-    extra_args = []
+    elements = []
+    opclass_map = {}
 
     if index.columns:
-        extra_args = [repr(col.name) for col in index.columns]
+        for col in index.columns:
+            elements.append(repr(col.name))
+
+            if (
+                "postgresql" in index.dialect_options
+                and index.dialect_options["postgresql"].get("using") == "gin"
+                and hasattr(col, "type")
+            ):
+                coltype = getattr(col.type, "python_type", None)
+                if isinstance(col.type, (types.String, types.Text, types.Unicode)) or (
+                    coltype and coltype is str
+                ):
+                    opclass_map[col.name] = "gin_trgm_ops"
 
     elif getattr(index, "expressions", None):
         for expr in index.expressions:
             expr_str = str(expr).strip()
-            expr_str = expr_str.replace('"""', '\\"\\"\\"')
-            extra_args.append(f'text("""{expr_str}""")')
+            elements.append(f"text({expr_str!r})")
 
-    if not extra_args:
-        name = index.name if index is not None else "<unnamed>"
-        table_name = index.table.name if index.table is not None else "<no-table>"
+            if (
+                "postgresql" in index.dialect_options
+                and index.dialect_options["postgresql"].get("using") == "gin"
+            ):
+                if (
+                    "::tsvector" not in expr_str
+                    and "array" not in expr_str.lower()
+                    and "json" not in expr_str.lower()
+                ):
+                    opclass_map[expr_str] = "gin_trgm_ops"
+
+    if not elements:
         print(
-            f"# WARNING: Skipped index '{name}' on table '{table_name}' because it has no columns or expressions."
+            f"# WARNING: Skipped index {getattr(index, 'name', None)!r} on table {getattr(index.table, 'name', None)!r} (no columns or expressions)."
         )
         return ""
 
     kwargs: dict[str, Any] = {}
+
     if index.unique:
         kwargs["unique"] = True
 
     if "postgresql" in index.dialect_options:
         dialect_opts = index.dialect_options["postgresql"]
         if "using" in dialect_opts:
+            using = dialect_opts["using"]
             kwargs["postgresql_using"] = (
-                repr(dialect_opts["using"])
-                if isinstance(dialect_opts["using"], str)
-                else dialect_opts["using"]
+                f"'{using}'" if isinstance(using, str) else using
             )
 
-    return render_callable("Index", repr(index.name), *extra_args, kwargs=kwargs)
+        if opclass_map:
+            kwargs["postgresql_ops"] = opclass_map
+
+    return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
 
 
 TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
@@ -560,9 +583,10 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             trigger_code = [self.render_trigger_ddl(t) for t in trigger_ddls]
             policy_code = [self.render_policy_ddl(p) for p in policy_ddls]
 
-            if trigger_code or policy_code:
+            if trigger_code:
                 rendered.append("# --- Triggers ---")
                 rendered.extend(trigger_code)
+            if policy_code:
                 rendered.append("# --- Policies ---")
                 rendered.extend(policy_code)
 
