@@ -174,6 +174,10 @@ def main() -> None:
             generator_tables = generator_class(metadata_tables, engine, options)
             f.write(generator_tables.generate())
         print(f"Tabellen-Models geschrieben nach: {args.outfile_tables}")
+        sql_functions = generator_tables.extract_user_functions(schema="public")
+        with open("functions.sql", "w") as f:
+            f.write(sql_functions)
+        print("SQL-Funktionen extrahiert und in 'functions.sql' geschrieben.")
     else:
         generator_tables = generator_class(metadata_tables, engine, options)
         print("### TABELLEN-MODELLE ###")

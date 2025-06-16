@@ -17,6 +17,39 @@ if TYPE_CHECKING:
     from sqlacodegen.generators import TablesGenerator
 
 
+def extract_user_functions(conn: Connection | Engine, schema: str = "public") -> str:
+    """
+    Extrahiert alle benutzerdefinierten Funktionen im angegebenen Schema und gibt sie als SQL-String zurück.
+    """
+    sql = """
+    SELECT pg_get_functiondef(p.oid) AS func
+    FROM pg_proc p
+    JOIN pg_namespace n ON p.pronamespace = n.oid
+    WHERE p.prokind = 'f'
+      AND n.nspname = :schema
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    ORDER BY n.nspname, p.proname;
+    """
+    close_after = False
+    if isinstance(conn, Engine):
+        conn = conn.connect()
+        close_after = True
+    try:
+        result = conn.execute(text(sql), {"schema": schema})
+        # Liefert alle Funktionen als einzelne CREATE FUNCTION ...-Blöcke
+        functions = []
+        for row in result:
+            func = row[0].strip()
+            # Sicherstellen, dass jede Function mit Semikolon endet
+            if not func.endswith(";"):
+                func += ";"
+            functions.append(func)
+        return "\n\n".join(functions) + ("\n" if functions else "")
+    finally:
+        if close_after:
+            conn.close()
+
+
 def sa_type_from_column(col: Column[Any]) -> str:
     t = col.type
 
@@ -287,6 +320,9 @@ TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
 
 
 class DeclarativeGeneratorWithViews(DeclarativeGenerator):
+    def extract_user_functions(self, schema: str = "public") -> str:
+        return extract_user_functions(self.bind, schema=schema)
+
     def get_triggers(self, schema: str = "public") -> list[dict[str, Any]]:
         query = """
         SELECT
