@@ -1,8 +1,16 @@
+from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Column, Index, text, types
+from sqlalchemy import (
+    Column,
+    ForeignKeyConstraint,
+    Index,
+    PrimaryKeyConstraint,
+    Table,
+    UniqueConstraint,
+    types,
+)
 from sqlalchemy import types as satypes
-from sqlalchemy.engine import Engine
 
 from sqlacodegen.generators import (
     Base,
@@ -11,10 +19,26 @@ from sqlacodegen.generators import (
     TablesGenerator,
 )
 from sqlacodegen.models import Model, ModelClass
-from sqlacodegen.utils import render_callable
+from sqlacodegen.utils import (
+    get_constraint_sort_key,
+    render_callable,
+    uses_default_name,
+)
 
 if TYPE_CHECKING:
     from sqlacodegen.generators import TablesGenerator
+
+EXCLUDED_TABLES = {"tmp_functest"}
+BASE_META_DATA = Base(
+    literal_imports=[
+        LiteralImport(
+            "risclog.claimxdb.clx.clx_models_base",
+            "PortalObject",
+        )
+    ],
+    declarations=[],
+    metadata_ref="PortalObject.metadata",
+)
 
 
 def sa_type_from_column(col: Column[Any]) -> str:
@@ -165,53 +189,11 @@ def sa_type_from_column(col: Column[Any]) -> str:
     return "String"
 
 
-EXCLUDED_TABLES = {"tmp_functest"}
-
-
-BASE_META_DATA = Base(
-    literal_imports=[
-        LiteralImport(
-            "risclog.claimxdb.clx.clx_models_base",
-            "PortalObject",
-        )
-    ],
-    declarations=[],
-    metadata_ref="PortalObject.metadata",
-)
-
-
 def clx_generate_base(self: "TablesGenerator") -> None:
     self.base = BASE_META_DATA
 
 
 TablesGenerator.generate_base = clx_generate_base  # type: ignore[method-assign]
-
-
-def get_expression_indexes(
-    engine: Engine, table_name: str, schema: str = "public"
-) -> list[dict[str, Any]]:
-    query = """
-    SELECT
-        t.relname AS table_name,
-        i.relname AS index_name,
-        a.amname  AS index_type,
-        pg_get_indexdef(ix.indexrelid) AS index_def,
-        ix.indisunique AS is_unique
-    FROM pg_class t
-    JOIN pg_index ix ON t.oid = ix.indrelid
-    JOIN pg_class i ON i.oid = ix.indexrelid
-    JOIN pg_am a ON i.relam = a.oid
-    JOIN pg_namespace n ON n.oid = t.relnamespace
-    WHERE t.relkind = 'r'
-      AND n.nspname = :schema
-      AND t.relname = :table_name
-      AND NOT ix.indisprimary
-      AND NOT ix.indisexclusion
-      AND ix.indisvalid
-    """
-    with engine.connect() as conn:
-        result = conn.execute(text(query), {"table_name": table_name, "schema": schema})
-        return [dict(row) for row in result]
 
 
 def clx_render_index(self: "TablesGenerator", index: Index) -> str:
@@ -277,7 +259,83 @@ def clx_render_index(self: "TablesGenerator", index: Index) -> str:
 TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
 
 
+def clx_render_table(self: "TablesGenerator", table: Table) -> str:
+    args: list[str] = [f"{table.name!r}, {self.base.metadata_ref}"]
+    kwargs: dict[str, object] = {}
+    for column in table.columns:
+        args.append(self.render_column(column, True, is_table=True))
+
+    for constraint in sorted(table.constraints, key=get_constraint_sort_key):
+        if uses_default_name(constraint):
+            if isinstance(constraint, PrimaryKeyConstraint):
+                continue
+            elif isinstance(constraint, (ForeignKeyConstraint, UniqueConstraint)):
+                if len(constraint.columns) == 1:
+                    continue
+        args.append(self.render_constraint(constraint))
+
+    for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
+        if len(index.columns) > 1 or not uses_default_name(index):
+            idx_code = self.render_index(index)
+            if idx_code.strip() and idx_code is not None:
+                args.append(idx_code)
+
+    if table.schema:
+        kwargs["schema"] = repr(table.schema)
+
+    table_comment = getattr(table, "comment", None)
+    if table_comment:
+        kwargs["comment"] = repr(table.comment)
+
+    return render_callable("Table", *args, kwargs=kwargs, indentation="    ")
+
+
+TablesGenerator.render_table = clx_render_table  # type: ignore[method-assign]
+
+
 class DeclarativeGeneratorWithViews(DeclarativeGenerator):
+    def clx_render_table_args(self, table: Table) -> str:
+        args: list[str] = []
+        kwargs: dict[str, str] = {}
+
+        for constraint in sorted(table.constraints, key=get_constraint_sort_key):
+            if uses_default_name(constraint):
+                if isinstance(constraint, PrimaryKeyConstraint):
+                    continue
+                if (
+                    isinstance(constraint, (ForeignKeyConstraint, UniqueConstraint))
+                    and len(constraint.columns) == 1
+                ):
+                    continue
+            args.append(self.render_constraint(constraint))
+
+        for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
+            if len(index.columns) > 1 or not uses_default_name(index):
+                idx_code = self.render_index(index)
+                if idx_code.strip() and idx_code is not None:
+                    args.append(idx_code)
+
+        if table.schema:
+            kwargs["schema"] = table.schema
+
+        if table.comment:
+            kwargs["comment"] = table.comment
+
+        if kwargs:
+            formatted_kwargs = pformat(kwargs)
+            if not args:
+                return formatted_kwargs
+            else:
+                args.append(formatted_kwargs)
+
+        if args:
+            rendered_args = f",\n{self.indentation}".join(args)
+            if len(args) == 1:
+                rendered_args += ","
+            return f"(\n{self.indentation}{rendered_args}\n)"
+        else:
+            return ""
+
     def generate_base(self) -> None:
         self.base = BASE_META_DATA
 
