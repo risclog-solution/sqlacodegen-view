@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import sys
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import inspect
@@ -100,6 +101,18 @@ def main() -> None:
     parser.add_argument(
         "--outfile-views", help="file to write view models to (default: views.py)"
     )
+    parser.add_argument(
+        "--outfile-functions",
+        help="file to write functions sql to (default: function.sql)",
+    )
+    parser.add_argument(
+        "--outfile-policies",
+        help="file to write policies sql to (default: policies.sql)",
+    )
+    parser.add_argument(
+        "--outfile-triggers",
+        help="file to write triggers triggers to (default: triggers.sql)",
+    )
 
     args = parser.parse_args()
 
@@ -170,26 +183,56 @@ def main() -> None:
 
     # Tabellen-Models
     if args.outfile_tables:
+        Path(args.outfile_tables).parent.mkdir(parents=True, exist_ok=True)
         with open(args.outfile_tables, "w", encoding="utf-8") as f:
             generator_tables = generator_class(metadata_tables, engine, options)
             f.write(generator_tables.generate())
         print(f"Tabellen-Models geschrieben nach: {args.outfile_tables}")
-        sql_functions = generator_tables.extract_user_functions(schema="public")
-        with open("functions.sql", "w") as f:
-            f.write(sql_functions)
-        print("SQL-Funktionen extrahiert und in 'functions.sql' geschrieben.")
     else:
         generator_tables = generator_class(metadata_tables, engine, options)
         print("### TABELLEN-MODELLE ###")
         print(generator_tables.generate())
 
-    # Views-Models
-    if args.outfile_views:
-        with open(args.outfile_views, "w", encoding="utf-8") as f:
-            generator_views = generator_class(metadata_views, engine, options)
-            f.write(generator_views.generate())
-        print(f"View-Models geschrieben nach: {args.outfile_views}")
-    else:
-        generator_views = generator_class(metadata_views, engine, options)
-        print("### VIEW-MODELLE ###")
-        print(generator_views.generate())
+    # # Views-Models
+    # if args.outfile_views:
+    #     with open(args.outfile_views, "w", encoding="utf-8") as f:
+    #         generator_views = generator_class(metadata_views, engine, options)
+    #         f.write(generator_views.generate())
+    #     print(f"View-Models geschrieben nach: {args.outfile_views}")
+    # else:
+    #     generator_views = generator_class(metadata_views, engine, options)
+    #     print("### VIEW-MODELLE ###")
+    #     print(generator_views.generate())
+
+    # # Funktionen
+    # if args.outfile_functions:
+    #     log = generator_tables.render_functions_block(
+    #         schema=args.schemas or "public",
+    #         out_path=args.outfile_functions
+    #     )
+    #     print(log)
+    # else:
+    #     log = generator_tables.render_functions_block(schema=args.schemas or "public")
+    #     print(log)
+
+    # # Policies
+    # if args.outfile_policies:
+    #     log = generator_tables.render_policies_block(
+    #         schema=args.schemas or "public",
+    #         out_path=args.outfile_policies
+    #     )
+    #     print(log)
+    # else:
+    #     log = generator_tables.render_policies_block(schema=args.schemas or "public")
+    #     print(log)
+
+    # # Triggers
+    # if args.outfile_triggers:
+    #     log = generator_tables.render_triggers_block(
+    #         schema=args.schemas or "public",
+    #         out_path=args.outfile_triggers
+    #     )
+    #     print(log)
+    # else:
+    #     log = generator_tables.render_triggers_block(schema=args.schemas or "public")
+    #     print(log)

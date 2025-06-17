@@ -1,8 +1,8 @@
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Column, Index, inspect, text, types
+from sqlalchemy import Column, Index, text, types
 from sqlalchemy import types as satypes
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Engine
 
 from sqlacodegen.generators import (
     Base,
@@ -15,39 +15,6 @@ from sqlacodegen.utils import render_callable
 
 if TYPE_CHECKING:
     from sqlacodegen.generators import TablesGenerator
-
-
-def extract_user_functions(conn: Connection | Engine, schema: str = "public") -> str:
-    """
-    Extrahiert alle benutzerdefinierten Funktionen im angegebenen Schema und gibt sie als SQL-String zurück.
-    """
-    sql = """
-    SELECT pg_get_functiondef(p.oid) AS func
-    FROM pg_proc p
-    JOIN pg_namespace n ON p.pronamespace = n.oid
-    WHERE p.prokind = 'f'
-      AND n.nspname = :schema
-      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-    ORDER BY n.nspname, p.proname;
-    """
-    close_after = False
-    if isinstance(conn, Engine):
-        conn = conn.connect()
-        close_after = True
-    try:
-        result = conn.execute(text(sql), {"schema": schema})
-        # Liefert alle Funktionen als einzelne CREATE FUNCTION ...-Blöcke
-        functions = []
-        for row in result:
-            func = row[0].strip()
-            # Sicherstellen, dass jede Function mit Semikolon endet
-            if not func.endswith(";"):
-                func += ";"
-            functions.append(func)
-        return "\n\n".join(functions) + ("\n" if functions else "")
-    finally:
-        if close_after:
-            conn.close()
 
 
 def sa_type_from_column(col: Column[Any]) -> str:
@@ -200,15 +167,6 @@ def sa_type_from_column(col: Column[Any]) -> str:
 
 EXCLUDED_TABLES = {"tmp_functest"}
 
-VIEW_CLASS_TEMPLATE = """\
-class {classname}(PortalObject):
-    __table__ = Table(
-        "{table_name}", PortalObject.metadata,
-{columns}
-    )
-    _sql_view_definition = text(\"\"\"{view_def}\"\"\")
-"""
-
 
 BASE_META_DATA = Base(
     literal_imports=[
@@ -320,195 +278,12 @@ TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
 
 
 class DeclarativeGeneratorWithViews(DeclarativeGenerator):
-    def extract_user_functions(self, schema: str = "public") -> str:
-        return extract_user_functions(self.bind, schema=schema)
-
-    def get_triggers(self, schema: str = "public") -> list[dict[str, Any]]:
-        query = """
-        SELECT
-            trg.tgname AS trigger_name,
-            tbl.relname AS table_name,
-            pg_get_triggerdef(trg.oid, true) AS trigger_def
-        FROM pg_trigger trg
-        JOIN pg_class tbl ON tbl.oid = trg.tgrelid
-        JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
-        WHERE NOT trg.tgisinternal
-        AND ns.nspname = :schema;
-        """
-        bind = self.bind
-        conn: Connection
-        if isinstance(bind, Engine):
-            conn = bind.connect()
-        else:
-            conn = bind  # already a Connection
-
-        with conn:
-            result = conn.execute(text(query), {"schema": schema}).mappings()
-            return [dict(row) for row in result]
-
-    def render_trigger_ddl(self, trigger: dict[str, Any]) -> str:
-        ddl = trigger["trigger_def"].strip().rstrip(";")
-        table = trigger["table_name"]
-        return (
-            f"trigger_sql_{trigger['trigger_name']} = DDL('''{ddl}''')\n"
-            f'event.listen(PortalObject.metadata.tables["{table}"], "after_create", trigger_sql_{trigger["trigger_name"]})'
-        )
-
-    def get_policies(self, schema: str = "public") -> list[dict[str, Any]]:
-        query = """
-        SELECT
-            pol.polname AS policy_name,
-            c.relname AS table_name,
-            pg_get_expr(pol.polqual, pol.polrelid) AS using_clause,
-            pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check,
-            pol.polcmd AS command,
-            pol.polroles AS roles
-        FROM pg_policy pol
-        JOIN pg_class c ON pol.polrelid = c.oid
-        JOIN pg_namespace ns ON ns.oid = c.relnamespace
-        WHERE ns.nspname = :schema;
-        """
-        bind = self.bind
-        conn: Connection
-        if isinstance(bind, Engine):
-            conn = bind.connect()
-        else:
-            conn = bind  # already a Connection
-
-        with conn:
-            result = conn.execute(text(query), {"schema": schema}).mappings()
-            return [dict(row) for row in result]
-
-    def render_policy_ddl(self, policy: dict[str, Any]) -> str:
-        using = f"USING ({policy['using_clause']})" if policy["using_clause"] else ""
-        check = f"WITH CHECK ({policy['with_check']})" if policy["with_check"] else ""
-        roles = (
-            ", ".join(f'"{r}"' for r in policy["roles"])
-            if policy["roles"]
-            else "PUBLIC"
-        )
-
-        stmt = (
-            f"CREATE POLICY {policy['policy_name']} ON {policy['table_name']} "
-            f"FOR {policy['command']} TO {roles} {using} {check}"
-        ).strip()
-
-        return (
-            f"policy_sql_{policy['policy_name']} = DDL('''{stmt}''')\n"
-            f'event.listen(PortalObject.metadata.tables["{policy["table_name"]}"], "after_create", policy_sql_{policy["policy_name"]})'
-        )
-
-    def render_sequences(self) -> str:
-        sequences: list[dict[str, Any]] = self.get_sequences()
-        rendered = []
-
-        for seq in sequences:
-            args = []
-            if seq["start_value"] != 1:
-                args.append(f"start={seq['start_value']}")
-            if seq["increment_by"] != 1:
-                args.append(f"increment={seq['increment_by']}")
-            if seq["min_value"] is not None:
-                args.append(f"minvalue={seq['min_value']}")
-            if seq["max_value"] is not None:
-                args.append(f"maxvalue={seq['max_value']}")
-            if seq["cache_size"] != 1:
-                args.append(f"cache={seq['cache_size']}")
-            if seq["cycle"]:
-                args.append("cycle=True")
-
-            rendered.append(
-                f'{seq["sequence_name"]} = Sequence("{seq["sequence_name"]}", {", ".join(args)})'
-            )
-
-        return "\n\n".join(rendered)
-
-    def get_sequences(self, schema: str = "public") -> list[dict[str, Any]]:
-        query = """
-        SELECT
-            c.relname AS sequence_name,
-            n.nspname AS schema_name,
-            s.seqstart AS start_value,
-            s.seqincrement AS increment_by,
-            s.seqmin AS min_value,
-            s.seqmax AS max_value,
-            s.seqcache AS cache_size,
-            s.seqcycle AS cycle
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_sequence s ON s.seqrelid = c.oid
-        WHERE c.relkind = 'S'
-        AND n.nspname = :schema;
-        """
-        bind = self.bind
-        conn: Connection
-        if isinstance(bind, Engine):
-            conn = bind.connect()
-        else:
-            conn = bind  # already a Connection
-
-        with conn:
-            result = conn.execute(text(query), {"schema": schema}).mappings()
-            return [dict(row) for row in result]
-
     def generate_base(self) -> None:
         self.base = BASE_META_DATA
 
-    def render_view_class(self, model: Model) -> str:
-        table = model.table
-        classname = "".join(x.capitalize() for x in table.name.split("_"))
-        if not classname.lower().endswith("view"):
-            classname += "View"
-
-        columns = []
-        has_id = False
-
-        for col in table.columns:
-            if col.name == "id":
-                has_id = True
-
-                columns.append(
-                    " " * 8
-                    + "Column('id', SA_UUID(as_uuid=True), primary_key=True, default=uuid4)"
-                )
-            else:
-                sa_type = sa_type_from_column(col)
-                columns.append(f"{' ' * 0}Column('{col.name}', {sa_type})")
-
-        if not has_id:
-            columns.insert(
-                0,
-                " " * 8
-                + "Column('id', SA_UUID(as_uuid=True), primary_key=True, default=uuid4)",
-            )
-
-        columns_code = ",\n        ".join(columns)
-
-        view_def = getattr(model, "view_definition", None)
-        if not view_def:
-            inspector = inspect(self.bind)
-            view_def = inspector.get_view_definition(table.name, table.schema)
-        view_def = (view_def or "").strip()
-
-        self.add_literal_import("sqlalchemy.dialects.postgresql", "UUID as SA_UUID")
-        self.add_literal_import("uuid", "uuid4")
-
-        result: str = VIEW_CLASS_TEMPLATE.format(
-            classname=classname,
-            table_name=table.name,
-            columns=columns_code,
-            view_def=view_def,
-        )
-        return result
-
     def render_models(self, models: list[Model]) -> str:
         rendered: list[str] = []
-        inspector = inspect(self.bind)
-        schemas = set(table.schema for table in self.metadata.tables.values())
-        views_by_schema = {
-            schema: set(inspector.get_view_names(schema=schema)) for schema in schemas
-        }
-        if_views: bool = False
+
         used_types: set[str] = set()
         type_imports = {
             "text": ("sqlalchemy", "text"),
@@ -533,7 +308,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             "TupleType": ("sqlalchemy", "TupleType"),
             "TypeDecorator": ("sqlalchemy", "TypeDecorator"),
             "ARRAY": ("sqlalchemy", "ARRAY"),
-            # "Uuid": ("sqlalchemy.dialects.postgresql", "UUID as SA_UUID"),
         }
 
         string_types = [
@@ -574,8 +348,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             if model.table.name in EXCLUDED_TABLES:
                 continue
             table = model.table
-            schema = table.schema
-            schema_views = views_by_schema.get(schema, set())
+            # schema = table.schema
 
             if table.schema and table.schema.startswith("pg_"):
                 continue  # Skip Postgres System-Views
@@ -587,12 +360,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 base_type = sa_type.split("(", 1)[0].strip()
                 used_types.add(base_type)
 
-            if table is not None and table.name in schema_views:
-                if_views = True
-                code = self.render_view_class(model)
-                rendered.append(code)
-                self.add_literal_import("sqlalchemy", "Column")
-            elif table is not None and isinstance(model, ModelClass):
+            if table is not None and isinstance(model, ModelClass):
                 self.base_class_name = "PortalObject"
                 rendered.append(self.render_class(model))
             elif table is not None:
@@ -605,28 +373,4 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
 
         self.add_literal_import("sqlalchemy", "text")
 
-        if not if_views:
-            # Sequences\
-            sequence_defs = self.render_sequences()
-            if sequence_defs:
-                rendered.append("# --- Sequences ---")
-                rendered.append(sequence_defs)
-
-            # DDL-Triggers und Policies rendern
-            trigger_ddls = self.get_triggers()
-            policy_ddls = self.get_policies()
-
-            trigger_code = [self.render_trigger_ddl(t) for t in trigger_ddls]
-            policy_code = [self.render_policy_ddl(p) for p in policy_ddls]
-
-            if trigger_code:
-                rendered.append("# --- Triggers ---")
-                rendered.extend(trigger_code)
-            if policy_code:
-                rendered.append("# --- Policies ---")
-                rendered.extend(policy_code)
-
-            self.add_literal_import("sqlalchemy", "Sequence")
-            self.add_literal_import("sqlalchemy", "DDL")
-            self.add_literal_import("sqlalchemy", "event")
         return "\n\n".join(rendered)
