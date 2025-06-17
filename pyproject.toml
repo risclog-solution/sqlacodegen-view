@@ -32,6 +32,7 @@ dependencies = [
     "SQLAlchemy >= 2.0.29",
     "inflect >= 4.0.0",
     "importlib_metadata; python_version < '3.10'",
+    "alembic_utils",
 ]
 dynamic = ["version"]
 
@@ -57,6 +58,7 @@ tables = "sqlacodegen.generators:TablesGenerator"
 declarative = "sqlacodegen.generators:DeclarativeGenerator"
 dataclasses = "sqlacodegen.generators:DataclassGenerator"
 sqlmodels = "sqlacodegen.generators:SQLModelGenerator"
+risclog = "sqlacodegen.risclog_generators:DeclarativeGeneratorWithViews"
 
 [project.scripts]
 sqlacodegen = "sqlacodegen.cli:main"

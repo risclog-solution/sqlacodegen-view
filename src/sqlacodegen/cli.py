@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import ast
 import sys
-from contextlib import ExitStack
-from typing import Any, TextIO
+from pathlib import Path
+from typing import Any
 
+from sqlalchemy import inspect
 from sqlalchemy.engine import create_engine
 from sqlalchemy.schema import MetaData
 
@@ -93,6 +94,26 @@ def main() -> None:
         ),
     )
     parser.add_argument("--outfile", help="file to write output to (default: stdout)")
+
+    parser.add_argument(
+        "--outfile-tables", help="file to write table models to (default: tables.py)"
+    )
+    parser.add_argument(
+        "--outfile-views", help="file to write view models to (default: views.py)"
+    )
+    parser.add_argument(
+        "--outfile-functions",
+        help="file to write functions sql to (default: function.sql)",
+    )
+    parser.add_argument(
+        "--outfile-policies",
+        help="file to write policies sql to (default: policies.sql)",
+    )
+    parser.add_argument(
+        "--outfile-triggers",
+        help="file to write triggers triggers to (default: triggers.sql)",
+    )
+
     args = parser.parse_args()
 
     if args.version:
@@ -137,14 +158,81 @@ def main() -> None:
             engine, schema, (generator.views_supported and not args.noviews), tables
         )
 
-    # Open the target file (if given)
-    with ExitStack() as stack:
-        outfile: TextIO
-        if args.outfile:
-            outfile = open(args.outfile, "w", encoding="utf-8")
-            stack.enter_context(outfile)
-        else:
-            outfile = sys.stdout
+    inspector = inspect(engine)
+    all_view_names = set()
+    for schema in schemas:
+        all_view_names |= set(inspector.get_view_names(schema=schema))
 
-        # Write the generated model code to the specified file or standard output
-        outfile.write(generator.generate())
+    table_names = []
+    view_names = []
+    for table in metadata.tables.values():
+        name = table.name
+        if name in all_view_names:
+            view_names.append(name)
+        else:
+            table_names.append(name)
+
+    # Separate MetaData reflektieren
+    metadata_tables = MetaData()
+    for schema in schemas:
+        metadata_tables.reflect(engine, schema=schema, only=table_names, views=False)
+
+    metadata_views = MetaData()
+    for schema in schemas:
+        metadata_views.reflect(engine, schema=schema, only=view_names, views=True)
+
+    # Tabellen-Models
+    if args.outfile_tables:
+        Path(args.outfile_tables).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.outfile_tables, "w", encoding="utf-8") as f:
+            generator_tables = generator_class(metadata_tables, engine, options)
+            f.write(generator_tables.generate())
+        print(f"Tabellen-Models geschrieben nach: {args.outfile_tables}")
+    else:
+        generator_tables = generator_class(metadata_tables, engine, options)
+        print("### TABELLEN-MODELLE ###")
+        print(generator_tables.generate())
+
+    # # Views-Models
+    # if args.outfile_views:
+    #     with open(args.outfile_views, "w", encoding="utf-8") as f:
+    #         generator_views = generator_class(metadata_views, engine, options)
+    #         f.write(generator_views.generate())
+    #     print(f"View-Models geschrieben nach: {args.outfile_views}")
+    # else:
+    #     generator_views = generator_class(metadata_views, engine, options)
+    #     print("### VIEW-MODELLE ###")
+    #     print(generator_views.generate())
+
+    # # Funktionen
+    # if args.outfile_functions:
+    #     log = generator_tables.render_functions_block(
+    #         schema=args.schemas or "public",
+    #         out_path=args.outfile_functions
+    #     )
+    #     print(log)
+    # else:
+    #     log = generator_tables.render_functions_block(schema=args.schemas or "public")
+    #     print(log)
+
+    # # Policies
+    # if args.outfile_policies:
+    #     log = generator_tables.render_policies_block(
+    #         schema=args.schemas or "public",
+    #         out_path=args.outfile_policies
+    #     )
+    #     print(log)
+    # else:
+    #     log = generator_tables.render_policies_block(schema=args.schemas or "public")
+    #     print(log)
+
+    # # Triggers
+    # if args.outfile_triggers:
+    #     log = generator_tables.render_triggers_block(
+    #         schema=args.schemas or "public",
+    #         out_path=args.outfile_triggers
+    #     )
+    #     print(log)
+    # else:
+    #     log = generator_tables.render_triggers_block(schema=args.schemas or "public")
+    #     print(log)
