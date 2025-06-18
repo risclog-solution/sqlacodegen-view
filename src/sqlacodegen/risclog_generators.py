@@ -62,7 +62,13 @@ ALEMBIC_FUNCTION_TEMPLATE = """{varname} = PGFunction(
     definition=\"\"\"{definition}\"\"\",
 )
 """
-
+ALEMBIC_POLICIES_TEMPLATE = """{varname} = PGPolicy(
+    schema={schema!r},
+    signature={signature!r},
+    definition=\"\"\"{definition}\"\"\",
+    on_entity={on_entity!r},
+)
+"""
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
 FROM
@@ -83,6 +89,20 @@ ORDER BY
     n.nspname,
     p.proname;
 """
+ALEMBIC_POLICIES_STATEMENT = """SELECT
+    pol.polname AS policy_name,
+    c.relname AS table_name,
+    pg_get_expr(pol.polqual, pol.polrelid) AS using_clause,
+    pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check,
+    pol.polcmd AS command,
+    pol.polroles AS roles
+FROM
+    pg_policy pol
+    JOIN pg_class c ON pol.polrelid = c.oid
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+WHERE
+    ns.nspname = 'public';
+"""
 
 
 def finalize_alembic_utils(
@@ -93,6 +113,10 @@ def finalize_alembic_utils(
     imports = {
         "all_views": "from alembic_utils.pg_view import PGView",
         "all_functions": "from alembic_utils.pg_function import PGFunction",
+        "all_policies": "from alembic_utils.pg_policy import PGPolicy",
+        "all_triggers": "from alembic_utils.pg_trigger import PGTrigger",
+        "all_sequences": "from alembic_utils.pg_sequence import PGSequence",
+        "all_extensions": "from alembic_utils.pg_extension import PGExtension",
     }
     import_stmt = imports.get(
         entities_name or "all_views",
@@ -137,6 +161,44 @@ def parse_function_row(
         signature=signature,
         definition=unescape_sql_string(squash_whitespace(definition)),
     ), name
+
+
+def parse_policy_row(
+    policy: dict[str, Any], template_def: str, schema: str | None
+) -> tuple[str, str]:
+    policy_name = policy["policy_name"]
+    table_name = policy["table_name"]
+    using = f"USING ({policy['using_clause']})" if policy.get("using_clause") else ""
+    check = f"WITH CHECK ({policy['with_check']})" if policy.get("with_check") else ""
+
+    roles_list = policy.get("roles")
+    if isinstance(roles_list, str):
+        roles = f'"{roles_list}"'
+    elif roles_list:
+        roles = ", ".join(f'"{r}"' for r in roles_list)
+    else:
+        roles = "PUBLIC"
+
+    if not using and not check:
+        definition = f"FOR {policy['command']} TO {roles}"
+    else:
+        definition = f"FOR {policy['command']} TO {roles} {using} {check}"
+    definition = re.sub(r"\s+", " ", definition)
+    definition = definition.rstrip() + " "
+
+    schema = schema or "public"
+    signature = f"{policy_name}.{table_name}"
+    on_entity = f"{schema}.{table_name}"
+    varname = f"{policy_name}_{table_name}".lower()
+
+    code = template_def.format(
+        varname=varname,
+        schema=schema,
+        signature=signature,
+        definition=definition,
+        on_entity=on_entity,
+    )
+    return code, varname
 
 
 def fetch_all_mappings(
