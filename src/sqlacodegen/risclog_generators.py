@@ -69,6 +69,12 @@ ALEMBIC_POLICIES_TEMPLATE = """{varname} = PGPolicy(
     on_entity={on_entity!r},
 )
 """
+ALEMBIC_TRIGGER_TEMPLATE = """{varname} = PGTrigger(
+    schema={schema!r},
+    signature={signature!r},
+    definition=\"\"\"{definition}\"\"\",
+)
+"""
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
 FROM
@@ -102,6 +108,18 @@ FROM
     JOIN pg_namespace ns ON ns.oid = c.relnamespace
 WHERE
     ns.nspname = 'public';
+"""
+ALEMBIC_TRIGGER_STATEMENT = """SELECT
+    trg.tgname AS trigger_name,
+    tbl.relname AS table_name,
+    pg_get_triggerdef(trg.oid, true) AS trigger_def
+FROM
+    pg_trigger trg
+    JOIN pg_class tbl ON tbl.oid = trg.tgrelid
+    JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+WHERE
+    NOT trg.tgisinternal
+    AND ns.nspname = 'public';
 """
 
 
@@ -197,6 +215,27 @@ def parse_policy_row(
         signature=signature,
         definition=definition,
         on_entity=on_entity,
+    )
+    return code, varname
+
+
+def parse_trigger_row(
+    trigger: dict[str, str], template_def: str, schema: str | None
+) -> tuple[str, str]:
+    trigger_name = trigger["trigger_name"]
+    table_name = trigger["table_name"]
+    schema = schema or "public"
+
+    varname = f"{trigger_name}_{table_name}".lower()
+    signature = f"{trigger_name}.{table_name}"
+    definition = trigger["trigger_def"].strip()
+    definition = re.sub(r"\s+", " ", trigger["trigger_def"]).strip()
+
+    code = template_def.format(
+        varname=varname,
+        schema=schema,
+        signature=signature,
+        definition=definition,
     )
     return code, varname
 
