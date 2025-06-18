@@ -1,3 +1,4 @@
+import re
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -8,6 +9,7 @@ from sqlalchemy import (
     PrimaryKeyConstraint,
     Table,
     UniqueConstraint,
+    inspect,
     types,
 )
 from sqlalchemy import types as satypes
@@ -32,13 +34,26 @@ EXCLUDED_TABLES = {"tmp_functest"}
 BASE_META_DATA = Base(
     literal_imports=[
         LiteralImport(
-            "risclog.claimxdb.clx.clx_models_base",
+            "risclog.claimxdb.database",
             "PortalObject",
         )
     ],
     declarations=[],
     metadata_ref="PortalObject.metadata",
 )
+ORM_VIEW_CLASS_TEMPLATE = """\
+class {classname}(PortalObject):
+    __table__ = Table(
+        "{table_name}", PortalObject.metadata,
+{columns}
+    )
+"""
+ALEMBIC_VIEW_CLASS_TEMPLATE = """{varname} = PGView(
+    schema={schema!r},
+    signature={signature!r},
+    definition=\"\"\"{definition}\"\"\",
+)
+"""
 
 
 def sa_type_from_column(col: Column[Any]) -> str:
@@ -293,8 +308,118 @@ def clx_render_table(self: "TablesGenerator", table: Table) -> str:
 TablesGenerator.render_table = clx_render_table  # type: ignore[method-assign]
 
 
+def clx_generate(self: "TablesGenerator") -> tuple[str, list[str] | None]:
+    self.generate_base()
+
+    sections: list[str] = []
+
+    # Remove unwanted elements from the metadata
+    for table in list(self.metadata.tables.values()):
+        if self.should_ignore_table(table):
+            self.metadata.remove(table)
+            continue
+
+        if "noindexes" in self.options:
+            table.indexes.clear()
+
+        if "noconstraints" in self.options:
+            table.constraints.clear()
+
+        if "nocomments" in self.options:
+            table.comment = None
+
+        for column in table.columns:
+            if "nocomments" in self.options:
+                column.comment = None
+
+    # Use information from column constraints to figure out the intended column
+    # types
+    for table in self.metadata.tables.values():
+        self.fix_column_types(table)
+
+    # Generate the models
+    models: list[Model] = self.generate_models()
+
+    # Render module level variables
+    variables = self.render_module_variables(models)
+    if variables:
+        sections.append(variables + "\n")
+
+    # Render models
+    rendered_models, pg_alembic_definition = self.render_models(models)  # type: ignore[misc]
+
+    if rendered_models:  # type: ignore[has-type]
+        sections.append(rendered_models)  # type: ignore[has-type]
+
+    # Render collected imports
+    groups = self.group_imports()
+    imports = "\n\n".join("\n".join(line for line in group) for group in groups)
+    if imports:
+        sections.insert(0, imports)
+
+    return "\n\n".join(sections) + "\n", pg_alembic_definition  # type: ignore[has-type]
+
+
+TablesGenerator.generate = clx_generate  # type: ignore[assignment]
+
+
 class DeclarativeGeneratorWithViews(DeclarativeGenerator):
-    def clx_render_table_args(self, table: Table) -> str:
+    def render_view_classes(
+        self, model: Model, signature: str, schema: str
+    ) -> tuple[str, str]:
+        table = model.table
+        classname = "".join(x.capitalize() for x in table.name.split("_"))
+        if not classname.lower().endswith("view"):
+            classname += "View"
+
+        columns = []
+        has_id = False
+
+        for col in table.columns:
+            if col.name == "id":
+                has_id = True
+
+                columns.append(
+                    " " * 8
+                    + "Column('id', SA_UUID(as_uuid=True), primary_key=True, default=uuid4)"
+                )
+            else:
+                sa_type = sa_type_from_column(col)
+                columns.append(f"{' ' * 0}Column('{col.name}', {sa_type})")
+
+        if not has_id:
+            columns.insert(
+                0,
+                " " * 8
+                + "Column('id', SA_UUID(as_uuid=True), primary_key=True, default=uuid4)",
+            )
+
+        columns_code = ",\n        ".join(columns)
+
+        view_def = getattr(model, "view_definition", None)
+        if not view_def:
+            inspector = inspect(self.bind)
+            view_def = inspector.get_view_definition(table.name, table.schema)
+        view_def = (view_def or "").strip()
+        view_def = re.sub(r"\s+", " ", view_def).strip()
+
+        self.add_literal_import("sqlalchemy.dialects.postgresql", "UUID as SA_UUID")
+        self.add_literal_import("uuid", "uuid4")
+
+        orm_result: str = ORM_VIEW_CLASS_TEMPLATE.format(
+            classname=classname,
+            table_name=table.name,
+            columns=columns_code,
+        )
+        alembic_result = ALEMBIC_VIEW_CLASS_TEMPLATE.format(
+            varname=signature,
+            schema=schema,
+            signature=signature,
+            definition=view_def,
+        )
+        return orm_result, alembic_result
+
+    def render_table_args(self, table: Table) -> str:
         args: list[str] = []
         kwargs: dict[str, str] = {}
 
@@ -339,9 +464,35 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
     def generate_base(self) -> None:
         self.base = BASE_META_DATA
 
-    def render_models(self, models: list[Model]) -> str:
-        rendered: list[str] = []
+    def finalize_alembic_utils(
+        self,
+        pg_alembic_definition: list[str],
+        entities: list[str],
+        entities_name: str | None,
+    ) -> list[str]:
+        imports = {
+            "all_views": "from alembic_utils.pg_view import PGView  # noqa: I001"
+        }
+        import_stmt = imports.get(
+            entities_name or "all_views",
+            "from alembic_utils.pg_view import PGView  # noqa: I001",
+        )
+        formatted = f"{entities_name} = [{', '.join(entities)}]\n"
+        pg_alembic_definition.append(formatted)
+        pg_alembic_definition.insert(0, f"{import_stmt}\n\n")
 
+        return pg_alembic_definition
+
+    def render_models(self, models: list[Model]) -> tuple[str, list[str] | None]:  # type: ignore[override]
+        rendered: list[str] = []
+        pg_alembic_definition = []
+        entities = []
+        entities_name = None
+        inspector = inspect(self.bind)
+        schemas = set(table.schema for table in self.metadata.tables.values())
+        views_by_schema = {
+            schema: set(inspector.get_view_names(schema=schema)) for schema in schemas
+        }
         used_types: set[str] = set()
         type_imports = {
             "text": ("sqlalchemy", "text"),
@@ -406,7 +557,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             if model.table.name in EXCLUDED_TABLES:
                 continue
             table = model.table
-            # schema = table.schema
+            schema = table.schema
+            schema_views = views_by_schema.get(schema, set())
 
             if table.schema and table.schema.startswith("pg_"):
                 continue  # Skip Postgres System-Views
@@ -418,7 +570,16 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 base_type = sa_type.split("(", 1)[0].strip()
                 used_types.add(base_type)
 
-            if table is not None and isinstance(model, ModelClass):
+            if table is not None and table.name in schema_views:
+                code, pg_alembic = self.render_view_classes(
+                    model, table.name, schema or "public"
+                )
+                pg_alembic_definition.append(pg_alembic)
+                entities.append(table.name)
+                entities_name = "all_views"
+                rendered.append(code)
+                self.add_literal_import("sqlalchemy", "Column")
+            elif table is not None and isinstance(model, ModelClass):
                 self.base_class_name = "PortalObject"
                 rendered.append(self.render_class(model))
             elif table is not None:
@@ -431,4 +592,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
 
         self.add_literal_import("sqlalchemy", "text")
 
-        return "\n\n".join(rendered)
+        return "\n\n".join(rendered), self.finalize_alembic_utils(
+            pg_alembic_definition, entities, entities_name
+        ) if pg_alembic_definition else None
