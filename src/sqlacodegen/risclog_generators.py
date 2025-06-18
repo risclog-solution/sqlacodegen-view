@@ -470,16 +470,14 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         entities: list[str],
         entities_name: str | None,
     ) -> list[str]:
-        imports = {
-            "all_views": "from alembic_utils.pg_view import PGView  # noqa: I001"
-        }
+        imports = {"all_views": "from alembic_utils.pg_view import PGView"}
         import_stmt = imports.get(
             entities_name or "all_views",
-            "from alembic_utils.pg_view import PGView  # noqa: I001",
+            "from alembic_utils.pg_view import PGView",
         )
         formatted = f"{entities_name} = [{', '.join(entities)}]\n"
         pg_alembic_definition.append(formatted)
-        pg_alembic_definition.insert(0, f"{import_stmt}\n\n")
+        pg_alembic_definition.insert(0, f"{import_stmt}  # noqa: I001\n\n")
 
         return pg_alembic_definition
 
