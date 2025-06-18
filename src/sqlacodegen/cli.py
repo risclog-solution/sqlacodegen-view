@@ -27,6 +27,7 @@ except ImportError:
 
 from sqlacodegen.risclog_generators import (
     parse_aggregate_row,
+    parse_extension_row,
     parse_function_row,
     parse_policy_row,
     parse_trigger_row,
@@ -306,3 +307,28 @@ def main() -> None:
         )
         print("### Aggregates ###")
         print(generator_functions)
+
+    # Extensions
+    if args.outfile_dir:
+        generator_extensions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_EXTENSION_TEMPLATE",
+            statement="ALEMBIC_EXTENSION_STATEMENT",
+            parse_row_func=parse_extension_row,
+            schema=args.schemas or "public",
+            entities_varname="all_extensions",
+        )
+        dest_pg_path = Path(parent, "pg_extensions.py")
+        with open(dest_pg_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(generator_extensions))
+
+        print(f"Extensions geschrieben nach: {dest_pg_path.as_posix()}")
+    else:
+        generator_extensions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_EXTENSION_TEMPLATE",
+            statement="ALEMBIC_EXTENSION_STATEMENT",
+            parse_row_func=parse_extension_row,
+            schema=args.schemas or "public",
+            entities_varname="all_extensions",
+        )
+        print("### Extensions ###")
+        print(generator_extensions)

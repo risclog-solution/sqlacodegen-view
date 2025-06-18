@@ -84,6 +84,13 @@ ALEMBIC_AGGREGATE_TEMPLATE = """{varname} = PGAggregate(
     initcond={initcond!r},
 )
 """
+ALEMBIC_EXTENSION_TEMPLATE = """{varname} = PGExtension(
+    schema={schema!r},
+    signature={signature!r},
+    definition={definition!r},
+)
+"""
+
 
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
@@ -164,6 +171,16 @@ WHERE
         WHERE d.objid = p.oid AND d.deptype = 'e'
     )
 ORDER BY n.nspname, p.proname;
+"""
+ALEMBIC_EXTENSION_STATEMENT = """SELECT
+    'CREATE EXTENSION IF NOT EXISTS ' || quote_ident(extname) ||
+    ' WITH SCHEMA ' || quote_ident(nspname) || ';'
+    AS create_extension_stmt,
+    extname,
+    nspname AS schema
+FROM pg_extension
+JOIN pg_namespace ON pg_extension.extnamespace = pg_namespace.oid
+ORDER BY extname;
 """
 
 
@@ -307,6 +324,19 @@ def parse_aggregate_row(
         stype=stype,
         finalfunc=finalfunc,
         initcond=initcond,
+    )
+    return code, varname
+
+
+def parse_extension_row(
+    row: dict[str, Any], template_def: str, schema: str | None
+) -> tuple[str, str]:
+    definition = row["create_extension_stmt"].strip()
+    signature = row["extname"]
+    schema_val = row["schema"] or schema or "public"
+    varname = f"{signature}_extension".lower()
+    code = template_def.format(
+        varname=varname, schema=schema_val, signature=signature, definition=definition
     )
     return code, varname
 
