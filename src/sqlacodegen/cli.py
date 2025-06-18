@@ -96,24 +96,8 @@ def main() -> None:
     parser.add_argument("--outfile", help="file to write output to (default: stdout)")
 
     parser.add_argument(
-        "--outfile-tables", help="file to write table models to (default: tables.py)"
+        "--outfile-dir", help="directory to write generated model files to (optional)"
     )
-    parser.add_argument(
-        "--outfile-views", help="file to write view models to (default: views.py)"
-    )
-    parser.add_argument(
-        "--outfile-functions",
-        help="file to write functions sql to (default: function.sql)",
-    )
-    parser.add_argument(
-        "--outfile-policies",
-        help="file to write policies sql to (default: policies.sql)",
-    )
-    parser.add_argument(
-        "--outfile-triggers",
-        help="file to write triggers triggers to (default: triggers.sql)",
-    )
-
     args = parser.parse_args()
 
     if args.version:
@@ -181,28 +165,41 @@ def main() -> None:
     for schema in schemas:
         metadata_views.reflect(engine, schema=schema, only=view_names, views=True)
 
+    if args.outfile_dir:
+        parent = Path(args.outfile_dir)
+        parent.mkdir(parents=True, exist_ok=True)
+
     # Tabellen-Models
-    if args.outfile_tables:
-        Path(args.outfile_tables).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.outfile_tables, "w", encoding="utf-8") as f:
+    if args.outfile_dir:
+        dest_orm_path = Path(parent, "orm_tables.py")
+        with open(dest_orm_path, "w", encoding="utf-8") as f:
             generator_tables = generator_class(metadata_tables, engine, options)
-            f.write(generator_tables.generate())
-        print(f"Tabellen-Models geschrieben nach: {args.outfile_tables}")
+            orm_tables, _ = generator_tables.generate()
+            f.write(orm_tables)
+        print(f"Tabellen-Models geschrieben nach: {dest_orm_path.as_posix()}")
     else:
         generator_tables = generator_class(metadata_tables, engine, options)
+        orm_tables, _ = generator_tables.generate()
         print("### TABELLEN-MODELLE ###")
-        print(generator_tables.generate())
+        print(orm_tables)
 
-    # # Views-Models
-    # if args.outfile_views:
-    #     with open(args.outfile_views, "w", encoding="utf-8") as f:
-    #         generator_views = generator_class(metadata_views, engine, options)
-    #         f.write(generator_views.generate())
-    #     print(f"View-Models geschrieben nach: {args.outfile_views}")
-    # else:
-    #     generator_views = generator_class(metadata_views, engine, options)
-    #     print("### VIEW-MODELLE ###")
-    #     print(generator_views.generate())
+    # Views-Models
+    if args.outfile_dir:
+        dest_orm_path = Path(parent, "orm_views.py")
+        dest_pg_path = Path(parent, "pg_views.py")
+        generator_views = generator_class(metadata_views, engine, options)
+        orm_views, pg_alembic = generator_views.generate()
+        with open(dest_orm_path, "w", encoding="utf-8") as f:
+            f.write(orm_views)
+        with open(dest_pg_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(pg_alembic))
+        print(f"View-Models geschrieben nach: {dest_orm_path.as_posix()}")
+        # print(pg_alembic)
+    else:
+        generator_views = generator_class(metadata_views, engine, options)
+        orm_views, pg_alembic = generator_views.generate()
+        print("### VIEW-MODELLE ###")
+        print(orm_views)
 
     # # Funktionen
     # if args.outfile_functions:
