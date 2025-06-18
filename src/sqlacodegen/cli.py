@@ -25,7 +25,7 @@ try:
 except ImportError:
     pgvector = None
 
-from sqlacodegen.risclog_generators import parse_function_row
+from sqlacodegen.risclog_generators import parse_function_row, parse_policy_row
 
 if sys.version_info < (3, 10):
     from importlib_metadata import entry_points, version
@@ -227,16 +227,30 @@ def main() -> None:
         print("### FUNKTIONEN ###")
         print(generator_functions)
 
-    # # Policies
-    # if args.outfile_policies:
-    #     log = generator_tables.render_policies_block(
-    #         schema=args.schemas or "public",
-    #         out_path=args.outfile_policies
-    #     )
-    #     print(log)
-    # else:
-    #     log = generator_tables.render_policies_block(schema=args.schemas or "public")
-    #     print(log)
+    # Policies
+    if args.outfile_dir:
+        generator_functions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_POLICIES_TEMPLATE",
+            statement="ALEMBIC_POLICIES_STATEMENT",
+            parse_row_func=parse_policy_row,
+            schema=args.schemas or "public",
+            entities_varname="all_policies",
+        )
+        dest_pg_path = Path(parent, "pg_policies.py")
+        with open(dest_pg_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(generator_functions))
+
+        print(f"Funktionen geschrieben nach: {dest_pg_path.as_posix()}")
+    else:
+        generator_functions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_POLICIES_TEMPLATE",
+            statement="ALEMBIC_POLICIES_STATEMENT",
+            parse_row_func=parse_policy_row,
+            schema=args.schemas or "public",
+            entities_varname="all_policies",
+        )
+        print("### FUNKTIONEN ###")
+        print(generator_functions)
 
     # # Triggers
     # if args.outfile_triggers:
