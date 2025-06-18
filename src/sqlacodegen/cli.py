@@ -26,6 +26,7 @@ except ImportError:
     pgvector = None
 
 from sqlacodegen.risclog_generators import (
+    parse_aggregate_row,
     parse_function_row,
     parse_policy_row,
     parse_trigger_row,
@@ -256,7 +257,7 @@ def main() -> None:
         print("### Policies ###")
         print(generator_functions)
 
-    # # Triggers
+    # Triggers
     if args.outfile_dir:
         generator_functions = generator_tables.generate_alembic_utils_entities(
             template="ALEMBIC_TRIGGER_TEMPLATE",
@@ -279,4 +280,29 @@ def main() -> None:
             entities_varname="all_triggers",
         )
         print("### Triggers ###")
+        print(generator_functions)
+
+    # Aggregates
+    if args.outfile_dir:
+        generator_functions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_AGGREGATE_TEMPLATE",
+            statement="ALEMBIC_AGGREGATE_STATEMENT",
+            parse_row_func=parse_aggregate_row,
+            schema=args.schemas or "public",
+            entities_varname="all_aggregates",
+        )
+        dest_pg_path = Path(parent, "pg_aggregates.py")
+        with open(dest_pg_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(generator_functions))
+
+        print(f"Aggregates geschrieben nach: {dest_pg_path.as_posix()}")
+    else:
+        generator_functions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_AGGREGATE_TEMPLATE",
+            statement="ALEMBIC_AGGREGATE_STATEMENT",
+            parse_row_func=parse_aggregate_row,
+            schema=args.schemas or "public",
+            entities_varname="all_aggregates",
+        )
+        print("### Aggregates ###")
         print(generator_functions)

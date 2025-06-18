@@ -75,6 +75,16 @@ ALEMBIC_TRIGGER_TEMPLATE = """{varname} = PGTrigger(
     definition=\"\"\"{definition}\"\"\",
 )
 """
+ALEMBIC_AGGREGATE_TEMPLATE = """{varname} = PGAggregate(
+    schema={schema!r},
+    signature={signature!r},
+    sfunc={sfunc!r},
+    stype={stype!r},
+    finalfunc={finalfunc!r},
+    initcond={initcond!r},
+)
+"""
+
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
 FROM
@@ -121,6 +131,40 @@ WHERE
     NOT trg.tgisinternal
     AND ns.nspname = 'public';
 """
+ALEMBIC_AGGREGATE_STATEMENT = """SELECT
+    n.nspname AS schema,
+    p.proname AS aggregate_name,
+    pg_get_function_identity_arguments(p.oid) AS args,
+    sf.sfunc_name AS sfunc,
+    st.typname AS stype,
+    ff.finalfunc_name AS finalfunc,
+    a.agginitval AS initcond
+FROM
+    pg_proc p
+    JOIN pg_namespace n ON p.pronamespace = n.oid
+    JOIN pg_aggregate a ON a.aggfnoid = p.oid
+    LEFT JOIN pg_type st ON a.aggtranstype = st.oid
+    LEFT JOIN LATERAL (
+        SELECT p1.proname AS sfunc_name
+        FROM pg_proc p1
+        WHERE p1.oid = a.aggtransfn
+    ) sf ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT p2.proname AS finalfunc_name
+        FROM pg_proc p2
+        WHERE p2.oid = a.aggfinalfn
+    ) ff ON TRUE
+WHERE
+    n.nspname = :schema
+    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_depend d
+        JOIN pg_extension e ON d.refobjid = e.oid
+        WHERE d.objid = p.oid AND d.deptype = 'e'
+    )
+ORDER BY n.nspname, p.proname;
+"""
 
 
 def finalize_alembic_utils(
@@ -135,6 +179,7 @@ def finalize_alembic_utils(
         "all_triggers": "from alembic_utils.pg_trigger import PGTrigger",
         "all_sequences": "from alembic_utils.pg_sequence import PGSequence",
         "all_extensions": "from alembic_utils.pg_extension import PGExtension",
+        "all_aggregates": "from alembic_utils.pg_aggregate import PGAggregate",
     }
     import_stmt = imports.get(
         entities_name or "all_views",
@@ -236,6 +281,32 @@ def parse_trigger_row(
         schema=schema,
         signature=signature,
         definition=definition,
+    )
+    return code, varname
+
+
+def parse_aggregate_row(
+    row: dict[str, str], template_def: str, schema: str | None
+) -> tuple[str, str]:
+    aggregate_name = row["aggregate_name"]
+    args = row.get("args", "")
+    sfunc = row.get("sfunc", None)
+    stype = row.get("stype", None)
+    finalfunc = row.get("finalfunc", None)
+    initcond = row.get("initcond", None)
+    schema = schema or row.get("schema") or "public"
+
+    signature = f"{aggregate_name}({args})"
+    varname = f"{aggregate_name}".lower()
+
+    code = template_def.format(
+        varname=varname,
+        schema=schema,
+        signature=signature,
+        sfunc=sfunc,
+        stype=stype,
+        finalfunc=finalfunc,
+        initcond=initcond,
     )
     return code, varname
 
