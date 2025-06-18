@@ -25,7 +25,11 @@ try:
 except ImportError:
     pgvector = None
 
-from sqlacodegen.risclog_generators import parse_function_row, parse_policy_row
+from sqlacodegen.risclog_generators import (
+    parse_function_row,
+    parse_policy_row,
+    parse_trigger_row,
+)
 
 if sys.version_info < (3, 10):
     from importlib_metadata import entry_points, version
@@ -240,7 +244,7 @@ def main() -> None:
         with open(dest_pg_path, "w", encoding="utf-8") as f:
             f.write("\n".join(generator_functions))
 
-        print(f"Funktionen geschrieben nach: {dest_pg_path.as_posix()}")
+        print(f"Policies geschrieben nach: {dest_pg_path.as_posix()}")
     else:
         generator_functions = generator_tables.generate_alembic_utils_entities(
             template="ALEMBIC_POLICIES_TEMPLATE",
@@ -249,16 +253,30 @@ def main() -> None:
             schema=args.schemas or "public",
             entities_varname="all_policies",
         )
-        print("### FUNKTIONEN ###")
+        print("### Policies ###")
         print(generator_functions)
 
     # # Triggers
-    # if args.outfile_triggers:
-    #     log = generator_tables.render_triggers_block(
-    #         schema=args.schemas or "public",
-    #         out_path=args.outfile_triggers
-    #     )
-    #     print(log)
-    # else:
-    #     log = generator_tables.render_triggers_block(schema=args.schemas or "public")
-    #     print(log)
+    if args.outfile_dir:
+        generator_functions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_TRIGGER_TEMPLATE",
+            statement="ALEMBIC_TRIGGER_STATEMENT",
+            parse_row_func=parse_trigger_row,
+            schema=args.schemas or "public",
+            entities_varname="all_triggers",
+        )
+        dest_pg_path = Path(parent, "pg_triggers.py")
+        with open(dest_pg_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(generator_functions))
+
+        print(f"Triggers geschrieben nach: {dest_pg_path.as_posix()}")
+    else:
+        generator_functions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_TRIGGER_TEMPLATE",
+            statement="ALEMBIC_TRIGGER_STATEMENT",
+            parse_row_func=parse_trigger_row,
+            schema=args.schemas or "public",
+            entities_varname="all_triggers",
+        )
+        print("### Triggers ###")
+        print(generator_functions)
