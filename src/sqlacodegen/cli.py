@@ -25,6 +25,8 @@ try:
 except ImportError:
     pgvector = None
 
+from sqlacodegen.risclog_generators import parse_function_row
+
 if sys.version_info < (3, 10):
     from importlib_metadata import entry_points, version
 else:
@@ -194,23 +196,36 @@ def main() -> None:
         with open(dest_pg_path, "w", encoding="utf-8") as f:
             f.write("\n".join(pg_alembic))
         print(f"View-Models geschrieben nach: {dest_orm_path.as_posix()}")
-        # print(pg_alembic)
     else:
         generator_views = generator_class(metadata_views, engine, options)
         orm_views, pg_alembic = generator_views.generate()
         print("### VIEW-MODELLE ###")
         print(orm_views)
 
-    # # Funktionen
-    # if args.outfile_functions:
-    #     log = generator_tables.render_functions_block(
-    #         schema=args.schemas or "public",
-    #         out_path=args.outfile_functions
-    #     )
-    #     print(log)
-    # else:
-    #     log = generator_tables.render_functions_block(schema=args.schemas or "public")
-    #     print(log)
+    # Funktionen
+    if args.outfile_dir:
+        generator_functions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_FUNCTION_TEMPLATE",
+            statement="ALEMBIC_FUNCTION_STATEMENT",
+            parse_row_func=parse_function_row,
+            schema=args.schemas or "public",
+            entities_varname="all_functions",
+        )
+        dest_pg_path = Path(parent, "pg_functions.py")
+        with open(dest_pg_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(generator_functions))
+
+        print(f"Funktionen geschrieben nach: {dest_pg_path.as_posix()}")
+    else:
+        generator_functions = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_FUNCTION_TEMPLATE",
+            statement="ALEMBIC_FUNCTION_STATEMENT",
+            parse_row_func=parse_function_row,
+            schema=args.schemas or "public",
+            entities_varname="all_functions",
+        )
+        print("### FUNKTIONEN ###")
+        print(generator_functions)
 
     # # Policies
     # if args.outfile_policies:

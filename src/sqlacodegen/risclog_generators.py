@@ -1,6 +1,6 @@
 import re
 from pprint import pformat
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from sqlalchemy import (
     Column,
@@ -10,9 +10,11 @@ from sqlalchemy import (
     Table,
     UniqueConstraint,
     inspect,
+    text,
     types,
 )
 from sqlalchemy import types as satypes
+from sqlalchemy.engine import Connection, Engine
 
 from sqlacodegen.generators import (
     Base,
@@ -54,6 +56,110 @@ ALEMBIC_VIEW_CLASS_TEMPLATE = """{varname} = PGView(
     definition=\"\"\"{definition}\"\"\",
 )
 """
+ALEMBIC_FUNCTION_TEMPLATE = """{varname} = PGFunction(
+    schema={schema!r},
+    signature={signature!r},
+    definition=\"\"\"{definition}\"\"\",
+)
+"""
+
+ALEMBIC_FUNCTION_STATEMENT = """SELECT
+    pg_get_functiondef(p.oid) AS func
+FROM
+    pg_proc p
+    JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE
+    p.prokind = 'f'
+    AND n.nspname = 'public'
+    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    -- Exclude functions that belong to extensions
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_depend d
+        JOIN pg_extension e ON d.refobjid = e.oid
+        WHERE d.objid = p.oid AND d.deptype = 'e'
+    )
+ORDER BY
+    n.nspname,
+    p.proname;
+"""
+
+
+def finalize_alembic_utils(
+    pg_alembic_definition: list[str],
+    entities: list[str],
+    entities_name: str | None,
+) -> list[str]:
+    imports = {
+        "all_views": "from alembic_utils.pg_view import PGView",
+        "all_functions": "from alembic_utils.pg_function import PGFunction",
+    }
+    import_stmt = imports.get(
+        entities_name or "all_views",
+        "from alembic_utils.pg_view import PGView",
+    )
+    formatted = f"{entities_name} = [{', '.join(entities)}]\n"
+    pg_alembic_definition.append(formatted)
+    pg_alembic_definition.insert(0, f"{import_stmt}  # noqa: I001\n\n")
+
+    return pg_alembic_definition
+
+
+def parse_function_row(
+    row: dict[str, Any], template_def: str, schema: str | None
+) -> tuple[str, str | Any]:
+    func_sql = row["func"]
+    m = re.search(
+        r"CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+([^(]+)\((.*?)\)",
+        func_sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        raise ValueError(f"Cannot extract function signature from: {func_sql[:100]}")
+    name = m.group(1).strip().split(".")[-1]
+    args = m.group(2).strip()
+    signature = f"{name}({args})"
+
+    m2 = re.search(
+        r"CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+[^(]+\([^)]*\)\s*",
+        func_sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m2:
+        raise ValueError(f"Cannot extract function body from: {func_sql[:100]}")
+    definition = func_sql[m2.end() :].strip()
+    schema = schema or "public"
+
+    name = name.lower()
+    return template_def.format(
+        varname=name,
+        schema=schema,
+        signature=signature,
+        definition=unescape_sql_string(squash_whitespace(definition)),
+    ), name
+
+
+def fetch_all_mappings(
+    conn: Connection, sql: str, params: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    if params is None:
+        params = {}
+    close_after = False
+
+    try:
+        result = conn.execute(text(sql), params)
+        return [dict(row) for row in result.mappings()]
+    finally:
+        if close_after:
+            conn.close()
+
+
+def squash_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def unescape_sql_string(s: str) -> str:
+    return re.sub(r"\\(['\"])", r"\1", s)
 
 
 def sa_type_from_column(col: Column[Any]) -> str:
@@ -364,6 +470,42 @@ TablesGenerator.generate = clx_generate  # type: ignore[assignment]
 
 
 class DeclarativeGeneratorWithViews(DeclarativeGenerator):
+    def generate_alembic_utils_entities(
+        self,
+        template: str,
+        statement: str,
+        parse_row_func: Callable[[dict[str, Any], str, str], str],
+        entities_varname: str,
+        schema: str = "public",
+    ) -> list[str]:
+        if isinstance(self.bind, Engine):
+            conn = self.bind.connect()
+        else:
+            conn = self.bind
+
+        if statement in globals():
+            sql = globals()[statement]
+        else:
+            raise ValueError(f"Unknown statement: {statement}")
+
+        if template in globals():
+            template_def = globals()[template]
+        else:
+            raise ValueError(f"Unknown template: {template}")
+
+        result: list[dict[str, Any]] = fetch_all_mappings(conn, sql, {"schema": schema})
+        entities: list[str] = [
+            parse_row_func(row, template_def, schema) for row in result
+        ]
+
+        code = [code for code, _ in entities]  # type: ignore  # noqa: PGH003
+        varnames = [varnames for _, varnames in entities]  # type: ignore  # noqa: PGH003
+        return finalize_alembic_utils(
+            code,
+            varnames,
+            entities_varname,
+        )
+
     def render_view_classes(
         self, model: Model, signature: str, schema: str
     ) -> tuple[str, str]:
@@ -401,7 +543,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             inspector = inspect(self.bind)
             view_def = inspector.get_view_definition(table.name, table.schema)
         view_def = (view_def or "").strip()
-        view_def = re.sub(r"\s+", " ", view_def).strip()
+        view_def = squash_whitespace(view_def)
 
         self.add_literal_import("sqlalchemy.dialects.postgresql", "UUID as SA_UUID")
         self.add_literal_import("uuid", "uuid4")
@@ -463,23 +605,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
 
     def generate_base(self) -> None:
         self.base = BASE_META_DATA
-
-    def finalize_alembic_utils(
-        self,
-        pg_alembic_definition: list[str],
-        entities: list[str],
-        entities_name: str | None,
-    ) -> list[str]:
-        imports = {"all_views": "from alembic_utils.pg_view import PGView"}
-        import_stmt = imports.get(
-            entities_name or "all_views",
-            "from alembic_utils.pg_view import PGView",
-        )
-        formatted = f"{entities_name} = [{', '.join(entities)}]\n"
-        pg_alembic_definition.append(formatted)
-        pg_alembic_definition.insert(0, f"{import_stmt}  # noqa: I001\n\n")
-
-        return pg_alembic_definition
 
     def render_models(self, models: list[Model]) -> tuple[str, list[str] | None]:  # type: ignore[override]
         rendered: list[str] = []
@@ -590,6 +715,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
 
         self.add_literal_import("sqlalchemy", "text")
 
-        return "\n\n".join(rendered), self.finalize_alembic_utils(
+        return "\n\n".join(rendered), finalize_alembic_utils(
             pg_alembic_definition, entities, entities_name
         ) if pg_alembic_definition else None
