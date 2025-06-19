@@ -4,7 +4,7 @@ import argparse
 import ast
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypedDict
 
 from sqlalchemy import inspect
 from sqlalchemy.engine import create_engine
@@ -179,194 +179,156 @@ def main() -> None:
         parent = Path(args.outfile_dir)
         parent.mkdir(parents=True, exist_ok=True)
 
-    # Tabellen-Models
+    # ----------- Mapping für Schleife vorbereiten ------------
+    class ExportDict(TypedDict, total=False):
+        title: str
+        only_outfile: bool
+        file: str
+        file2: str
+        gen_func: Callable[[Any], tuple[Any, Any]]
+        entities_varname: str
+        template: str
+        statement: str
+        parse_row_func: Callable[..., Any]
+
+    EXPORTS = [
+        {
+            "title": "Tabellen-Models",
+            "only_outfile": True,
+            "gen_func": lambda generator: generator.generate(),
+            "file": "orm_tables.py",
+        },
+        {
+            "title": "Views-Models",
+            "only_outfile": False,
+            "gen_func": lambda generator: generator.generate(),
+            "file": "orm_views.py",
+            "file2": "pg_views.py",
+        },
+        {
+            "title": "Funktionen",
+            "entities_varname": "all_functions",
+            "template": "ALEMBIC_FUNCTION_TEMPLATE",
+            "statement": "ALEMBIC_FUNCTION_STATEMENT",
+            "parse_row_func": parse_function_row,
+            "file": "pg_functions.py",
+        },
+        {
+            "title": "Policies",
+            "entities_varname": "all_policies",
+            "template": "ALEMBIC_POLICIES_TEMPLATE",
+            "statement": "ALEMBIC_POLICIES_STATEMENT",
+            "parse_row_func": parse_policy_row,
+            "file": "pg_policies.py",
+        },
+        {
+            "title": "Triggers",
+            "entities_varname": "all_triggers",
+            "template": "ALEMBIC_TRIGGER_TEMPLATE",
+            "statement": "ALEMBIC_TRIGGER_STATEMENT",
+            "parse_row_func": parse_trigger_row,
+            "file": "pg_triggers.py",
+        },
+        {
+            "title": "Aggregates",
+            "entities_varname": "all_aggregates",
+            "template": "ALEMBIC_AGGREGATE_TEMPLATE",
+            "statement": "ALEMBIC_AGGREGATE_STATEMENT",
+            "parse_row_func": parse_aggregate_row,
+            "file": "pg_aggregates.py",
+        },
+        {
+            "title": "Extensions",
+            "entities_varname": "all_extensions",
+            "template": "ALEMBIC_EXTENSION_TEMPLATE",
+            "statement": "ALEMBIC_EXTENSION_STATEMENT",
+            "parse_row_func": parse_extension_row,
+            "file": "pg_extensions.py",
+        },
+        {
+            "title": "Sequences",
+            "entities_varname": "all_sequences",
+            "template": "ALEMBIC_SEQUENCE_TEMPLATE",
+            "statement": "ALEMBIC_SEQUENCE_STATEMENT",
+            "parse_row_func": parse_sequence_row,
+            "file": "pg_sequences.py",
+        },
+    ]
+
+    # ----------- Export-Loop ------------
+    for export in EXPORTS:
+        title = str(export["title"])
+        gen_func = export.get("gen_func")
+
+        if "only_outfile" in export and export["only_outfile"]:
+            if args.outfile_dir:
+                dest_path = Path(str(parent), str(export["file"]))
+                generator_tables = generator_class(metadata_tables, engine, options)
+                orm_tables, _ = gen_func(generator_tables)  # type: ignore[operator]
+                with open(dest_path, "w", encoding="utf-8") as f:
+                    f.write(orm_tables)
+                print(f"{title} geschrieben nach: {dest_path.as_posix()}")
+            else:
+                generator_tables = generator_class(metadata_tables, engine, options)
+                orm_tables, _ = gen_func(generator_tables)  # type: ignore[operator]
+                print(f"### {title.upper()} ###")
+                print(orm_tables)
+            continue
+
+        if title == "Views-Models":
+            if args.outfile_dir:
+                dest_orm_path = Path(str(parent), str(export["file"]))
+                dest_pg_path = Path(str(parent), str(export["file2"]))
+                generator_views = generator_class(metadata_views, engine, options)
+                orm_views, pg_alembic = gen_func(generator_views)  # type: ignore[operator]
+                with open(dest_orm_path, "w", encoding="utf-8") as f:
+                    f.write(orm_views)
+                with open(dest_pg_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(pg_alembic))
+                print(f"{title} geschrieben nach: {dest_orm_path.as_posix()}")
+            else:
+                generator_views = generator_class(metadata_views, engine, options)
+                orm_views, pg_alembic = gen_func(generator_views)  # type: ignore[operator]
+                print(f"### {title.upper()} ###")
+                print(orm_views)
+            continue
+
+        # Alles andere (alembic_utils)
+        entities_varname = export["entities_varname"]
+        template = export["template"]
+        statement = export["statement"]
+        parse_row_func = export["parse_row_func"]
+        file_name = export["file"]
+
+        if args.outfile_dir:
+            generator_functions = generator_tables.generate_alembic_utils_entities(
+                template=template,
+                statement=statement,
+                parse_row_func=parse_row_func,
+                schema=args.schemas or "public",
+                entities_varname=entities_varname,
+            )
+            dest_pg_path = Path(str(parent), str(file_name))
+            with open(dest_pg_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(generator_functions))
+            print(f"{title} geschrieben nach: {dest_pg_path.as_posix()}")
+        else:
+            generator_functions = generator_tables.generate_alembic_utils_entities(
+                template=template,
+                statement=statement,
+                parse_row_func=parse_row_func,
+                schema=args.schemas or "public",
+                entities_varname=entities_varname,
+            )
+            print(f"### {title.upper()} ###")
+            print(generator_functions)
+
+    # ----------- PGData SEED Export separat ------------
     if args.outfile_dir:
-        dest_orm_path = Path(parent, "orm_tables.py")
-        with open(dest_orm_path, "w", encoding="utf-8") as f:
-            generator_tables = generator_class(metadata_tables, engine, options)
-            orm_tables, _ = generator_tables.generate()
-            f.write(orm_tables)
-        print(f"Tabellen-Models geschrieben nach: {dest_orm_path.as_posix()}")
-    else:
-        generator_tables = generator_class(metadata_tables, engine, options)
-        orm_tables, _ = generator_tables.generate()
-        print("### TABELLEN-MODELLE ###")
-        print(orm_tables)
-
-    # Views-Models
-    if args.outfile_dir:
-        dest_orm_path = Path(parent, "orm_views.py")
-        dest_pg_path = Path(parent, "pg_views.py")
-        generator_views = generator_class(metadata_views, engine, options)
-        orm_views, pg_alembic = generator_views.generate()
-        with open(dest_orm_path, "w", encoding="utf-8") as f:
-            f.write(orm_views)
-        with open(dest_pg_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(pg_alembic))
-        print(f"View-Models geschrieben nach: {dest_orm_path.as_posix()}")
-    else:
-        generator_views = generator_class(metadata_views, engine, options)
-        orm_views, pg_alembic = generator_views.generate()
-        print("### VIEW-MODELLE ###")
-        print(orm_views)
-
-    # Funktionen
-    if args.outfile_dir:
-        generator_functions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_FUNCTION_TEMPLATE",
-            statement="ALEMBIC_FUNCTION_STATEMENT",
-            parse_row_func=parse_function_row,
-            schema=args.schemas or "public",
-            entities_varname="all_functions",
-        )
-        dest_pg_path = Path(parent, "pg_functions.py")
-        with open(dest_pg_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(generator_functions))
-
-        print(f"Funktionen geschrieben nach: {dest_pg_path.as_posix()}")
-    else:
-        generator_functions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_FUNCTION_TEMPLATE",
-            statement="ALEMBIC_FUNCTION_STATEMENT",
-            parse_row_func=parse_function_row,
-            schema=args.schemas or "public",
-            entities_varname="all_functions",
-        )
-        print("### FUNKTIONEN ###")
-        print(generator_functions)
-
-    # Policies
-    if args.outfile_dir:
-        generator_functions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_POLICIES_TEMPLATE",
-            statement="ALEMBIC_POLICIES_STATEMENT",
-            parse_row_func=parse_policy_row,
-            schema=args.schemas or "public",
-            entities_varname="all_policies",
-        )
-        dest_pg_path = Path(parent, "pg_policies.py")
-        with open(dest_pg_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(generator_functions))
-
-        print(f"Policies geschrieben nach: {dest_pg_path.as_posix()}")
-    else:
-        generator_functions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_POLICIES_TEMPLATE",
-            statement="ALEMBIC_POLICIES_STATEMENT",
-            parse_row_func=parse_policy_row,
-            schema=args.schemas or "public",
-            entities_varname="all_policies",
-        )
-        print("### Policies ###")
-        print(generator_functions)
-
-    # Triggers
-    if args.outfile_dir:
-        generator_functions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_TRIGGER_TEMPLATE",
-            statement="ALEMBIC_TRIGGER_STATEMENT",
-            parse_row_func=parse_trigger_row,
-            schema=args.schemas or "public",
-            entities_varname="all_triggers",
-        )
-        dest_pg_path = Path(parent, "pg_triggers.py")
-        with open(dest_pg_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(generator_functions))
-
-        print(f"Triggers geschrieben nach: {dest_pg_path.as_posix()}")
-    else:
-        generator_functions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_TRIGGER_TEMPLATE",
-            statement="ALEMBIC_TRIGGER_STATEMENT",
-            parse_row_func=parse_trigger_row,
-            schema=args.schemas or "public",
-            entities_varname="all_triggers",
-        )
-        print("### Triggers ###")
-        print(generator_functions)
-
-    # Aggregates
-    if args.outfile_dir:
-        generator_functions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_AGGREGATE_TEMPLATE",
-            statement="ALEMBIC_AGGREGATE_STATEMENT",
-            parse_row_func=parse_aggregate_row,
-            schema=args.schemas or "public",
-            entities_varname="all_aggregates",
-        )
-        dest_pg_path = Path(parent, "pg_aggregates.py")
-        with open(dest_pg_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(generator_functions))
-
-        print(f"Aggregates geschrieben nach: {dest_pg_path.as_posix()}")
-    else:
-        generator_functions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_AGGREGATE_TEMPLATE",
-            statement="ALEMBIC_AGGREGATE_STATEMENT",
-            parse_row_func=parse_aggregate_row,
-            schema=args.schemas or "public",
-            entities_varname="all_aggregates",
-        )
-        print("### Aggregates ###")
-        print(generator_functions)
-
-    # Extensions
-    if args.outfile_dir:
-        generator_extensions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_EXTENSION_TEMPLATE",
-            statement="ALEMBIC_EXTENSION_STATEMENT",
-            parse_row_func=parse_extension_row,
-            schema=args.schemas or "public",
-            entities_varname="all_extensions",
-        )
-        dest_pg_path = Path(parent, "pg_extensions.py")
-        with open(dest_pg_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(generator_extensions))
-
-        print(f"Extensions geschrieben nach: {dest_pg_path.as_posix()}")
-    else:
-        generator_extensions = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_EXTENSION_TEMPLATE",
-            statement="ALEMBIC_EXTENSION_STATEMENT",
-            parse_row_func=parse_extension_row,
-            schema=args.schemas or "public",
-            entities_varname="all_extensions",
-        )
-        print("### Extensions ###")
-        print(generator_extensions)
-
-    # Sequences
-    if args.outfile_dir:
-        generator_sequences = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_SEQUENCE_TEMPLATE",
-            statement="ALEMBIC_SEQUENCE_STATEMENT",
-            parse_row_func=parse_sequence_row,
-            schema=args.schemas or "public",
-            entities_varname="all_sequences",
-        )
-        dest_pg_path = Path(parent, "pg_sequences.py")
-        with open(dest_pg_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(generator_sequences))
-
-        print(f"Sequences geschrieben nach: {dest_pg_path.as_posix()}")
-    else:
-        generator_sequences = generator_tables.generate_alembic_utils_entities(
-            template="ALEMBIC_SEQUENCE_TEMPLATE",
-            statement="ALEMBIC_SEQUENCE_STATEMENT",
-            parse_row_func=parse_sequence_row,
-            schema=args.schemas or "public",
-            entities_varname="all_sequences",
-        )
-        print("### Sequences ###")
-        print(generator_sequences)
-
-    # SEED-Export: PGData als Python-Modul
-    if args.outfile_dir:
-        dest_pg_path = Path(parent, "pg_seeds.py")
+        dest_pg_path = Path(str(parent), "pg_seeds.py")
         export_pgdata_py(
             engine=engine,
             metadata=metadata_tables,
             out_path=dest_pg_path,
-            max_rows=100,  # Beliebig anpassen
         )
         print(f"PGData Seed geschrieben nach: {dest_pg_path.as_posix()}")
