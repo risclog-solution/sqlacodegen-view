@@ -33,6 +33,7 @@ from sqlacodegen.risclog_generators import (
     parse_sequence_row,
     parse_trigger_row,
 )
+from sqlacodegen.seed_export import export_pgdata_py
 
 if sys.version_info < (3, 10):
     from importlib_metadata import entry_points, version
@@ -358,3 +359,14 @@ def main() -> None:
         )
         print("### Sequences ###")
         print(generator_sequences)
+
+    # SEED-Export: PGData als Python-Modul
+    if args.outfile_dir:
+        dest_pg_path = Path(parent, "pg_seeds.py")
+        export_pgdata_py(
+            engine=engine,
+            metadata=metadata_tables,
+            out_path=dest_pg_path,
+            max_rows=100,  # Beliebig anpassen
+        )
+        print(f"PGData Seed geschrieben nach: {dest_pg_path.as_posix()}")
