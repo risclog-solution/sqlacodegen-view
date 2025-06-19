@@ -90,8 +90,17 @@ ALEMBIC_EXTENSION_TEMPLATE = """{varname} = PGExtension(
     definition={definition!r},
 )
 """
-
-
+ALEMBIC_SEQUENCE_TEMPLATE = """{varname} = PGSequence(
+    schema={schema!r},
+    signature={signature!r},
+    data_type={data_type!r},
+    start_value={start_value},
+    minvalue={minimum_value},
+    maxvalue={maximum_value},
+    increment={increment},
+    cycle={cycle},
+)
+"""
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
 FROM
@@ -181,6 +190,19 @@ ALEMBIC_EXTENSION_STATEMENT = """SELECT
 FROM pg_extension
 JOIN pg_namespace ON pg_extension.extnamespace = pg_namespace.oid
 ORDER BY extname;
+"""
+ALEMBIC_SEQUENCE_STATEMENT = """SELECT
+    sequence_schema AS schema,
+    sequence_name,
+    data_type,
+    start_value,
+    minimum_value,
+    maximum_value,
+    increment,
+    cycle_option AS cycle
+FROM information_schema.sequences
+WHERE sequence_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY sequence_schema, sequence_name;
 """
 
 
@@ -337,6 +359,26 @@ def parse_extension_row(
     varname = f"{signature}_extension".lower()
     code = template_def.format(
         varname=varname, schema=schema_val, signature=signature, definition=definition
+    )
+    return code, varname
+
+
+def parse_sequence_row(
+    row: dict[str, Any], template_def: str, schema: str | None
+) -> tuple[str, str]:
+    cycle = row["cycle"].upper() in ("YES", "true", "TRUE", "on", "ON", "1")
+    varname = f"{row['sequence_name']}_sequence".lower()
+    signature = row["sequence_name"]
+    code = template_def.format(
+        varname=varname,
+        schema=row["schema"] or schema or "public",
+        signature=signature,
+        data_type=row["data_type"],
+        start_value=row["start_value"],
+        minimum_value=row["minimum_value"],
+        maximum_value=row["maximum_value"],
+        increment=row["increment"],
+        cycle=cycle,
     )
     return code, varname
 

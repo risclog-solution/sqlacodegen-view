@@ -30,6 +30,7 @@ from sqlacodegen.risclog_generators import (
     parse_extension_row,
     parse_function_row,
     parse_policy_row,
+    parse_sequence_row,
     parse_trigger_row,
 )
 
@@ -332,3 +333,28 @@ def main() -> None:
         )
         print("### Extensions ###")
         print(generator_extensions)
+
+    # Sequences
+    if args.outfile_dir:
+        generator_sequences = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_SEQUENCE_TEMPLATE",
+            statement="ALEMBIC_SEQUENCE_STATEMENT",
+            parse_row_func=parse_sequence_row,
+            schema=args.schemas or "public",
+            entities_varname="all_sequences",
+        )
+        dest_pg_path = Path(parent, "pg_sequences.py")
+        with open(dest_pg_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(generator_sequences))
+
+        print(f"Sequences geschrieben nach: {dest_pg_path.as_posix()}")
+    else:
+        generator_sequences = generator_tables.generate_alembic_utils_entities(
+            template="ALEMBIC_SEQUENCE_TEMPLATE",
+            statement="ALEMBIC_SEQUENCE_STATEMENT",
+            parse_row_func=parse_sequence_row,
+            schema=args.schemas or "public",
+            entities_varname="all_sequences",
+        )
+        print("### Sequences ###")
+        print(generator_sequences)
