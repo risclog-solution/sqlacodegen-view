@@ -15,8 +15,7 @@ from polyfactory.pytest_plugin import register_fixture
 FACTORY_TEMPLATE = '''\
 @register_fixture(name="{fixture_name}")
 class {class_name}Factory(SQLAlchemyFactory[{class_name}]):
-    __model__ = {class_name}
-{set_relationships}
+    __model__ = {class_name}{set_relationships}
 '''
 
 def camel_to_snake(name: str) -> str:
@@ -25,7 +24,7 @@ def camel_to_snake(name: str) -> str:
 
 def render_factory(model: type[Any]) -> str:
     has_fk = bool(getattr(model.__table__, "foreign_keys", []))
-    set_relationships = "    __set_relationships__ = True" if has_fk else ""
+    set_relationships = "\n    __set_relationships__ = True" if has_fk else ""
     class_name = model.__name__
     fixture_name = f"{camel_to_snake(class_name)}_factory"
     return FACTORY_TEMPLATE.format(
