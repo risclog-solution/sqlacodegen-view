@@ -25,6 +25,7 @@ try:
 except ImportError:
     pgvector = None
 
+from sqlacodegen.generate_factory_fixtures import export_factory_fixtures
 from sqlacodegen.risclog_generators import (
     parse_aggregate_row,
     parse_extension_row,
@@ -33,7 +34,7 @@ from sqlacodegen.risclog_generators import (
     parse_sequence_row,
     parse_trigger_row,
 )
-from sqlacodegen.seed_export import export_pgdata_py
+from sqlacodegen.seed_export import export_pgdata_py, get_table_dependency_order
 
 if sys.version_info < (3, 10):
     from importlib_metadata import entry_points, version
@@ -332,3 +333,43 @@ def main() -> None:
             out_path=dest_pg_path,
         )
         print(f"PGData Seed geschrieben nach: {dest_pg_path.as_posix()}")
+
+        # ----------- Factories & Fixtures Export separat ------------
+        def get_all_models(base: type[Any]) -> list[type[Any]]:
+            seen = set()
+            todo = list(base.__subclasses__())
+            models = []
+            while todo:
+                m = todo.pop()
+                if m not in seen and hasattr(m, "__tablename__"):
+                    models.append(m)
+                    seen.add(m)
+                    todo.extend(m.__subclasses__())
+            return models
+
+        def make_dynamic_models(metadata: MetaData) -> dict[str, type[Any]]:
+            from sqlalchemy.ext.declarative import declarative_base
+
+            Base = declarative_base(metadata=metadata)
+            models_by_table = {}
+            for table in metadata.tables.values():
+                class_name = "".join([w.capitalize() for w in table.name.split("_")])
+                model = type(class_name, (Base,), {"__table__": table})
+                models_by_table[table.name] = model
+            return models_by_table
+
+        Base = getattr(generator, "base", None)
+        if Base is not None:
+            models = get_all_models(Base)
+            models_by_table = {m.__tablename__: m for m in models}
+        else:
+            models_by_table = make_dynamic_models(metadata_tables)
+
+        dependency_order = get_table_dependency_order(metadata_tables)
+
+        export_factory_fixtures(
+            models_by_table=models_by_table,
+            factories_path=Path(parent) / "factories.py",
+            dependency_order=dependency_order,
+        )
+        print(f"Factories & Fixtures geschrieben nach: {parent.as_posix()}")
