@@ -32,7 +32,7 @@ from sqlacodegen.utils import (
 if TYPE_CHECKING:
     from sqlacodegen.generators import TablesGenerator
 
-EXCLUDED_TABLES = {"tmp_functest"}
+EXCLUDED_TABLES = {"tmp_functest", "accesslogfailed"}
 BASE_META_DATA = Base(
     literal_imports=[
         LiteralImport(
