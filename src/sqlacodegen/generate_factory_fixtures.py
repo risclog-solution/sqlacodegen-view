@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any, Sequence
 from sqlalchemy.engine import Engine
@@ -12,19 +13,27 @@ from polyfactory.pytest_plugin import register_fixture
 '''
 
 FACTORY_TEMPLATE = '''\
-@register_fixture
-class {class_name}Factory(SQLAlchemyFactory):
+@register_fixture(name="{fixture_name}")
+class {class_name}Factory(SQLAlchemyFactory[{class_name}]):
     __model__ = {class_name}
 {set_relationships}
 '''
 
+def camel_to_snake(name: str) -> str:
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
 def render_factory(model: type[Any]) -> str:
     has_fk = bool(getattr(model.__table__, "foreign_keys", []))
     set_relationships = "    __set_relationships__ = True" if has_fk else ""
+    class_name = model.__name__
+    fixture_name = f"{camel_to_snake(class_name)}_factory"
     return FACTORY_TEMPLATE.format(
-        class_name=model.__name__,
+        fixture_name=fixture_name,
+        class_name=class_name,
         set_relationships=set_relationships,
     )
+
 
 def export_factory_fixtures(
     models_by_table: dict[str, type[Any]],
