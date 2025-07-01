@@ -68,6 +68,7 @@ ALEMBIC_POLICIES_TEMPLATE = """{varname} = PGPolicy(
     signature={signature!r},
     definition=\"\"\"{definition}\"\"\",
     on_entity={on_entity!r},
+    enable_rls={enable_rls}
 )
 """
 ALEMBIC_TRIGGER_TEMPLATE = """{varname} = PGTrigger(
@@ -291,7 +292,10 @@ def parse_function_row(
 
 
 def parse_policy_row(
-    policy: dict[str, Any], template_def: str, schema: str | None
+    policy: dict[str, Any],
+    template_def: str,
+    schema: str | None,
+    rls_enabled_tables: set[tuple[str, str]],
 ) -> tuple[str, str] | None:
     policy_name = policy["policy_name"]
     schema_name = policy.get("schema_name", schema) or "public"
@@ -315,12 +319,19 @@ def parse_policy_row(
     on_entity = f"{schema_name}.{table_name}"
     varname = f"{policy_name}_{table_name}".lower()
 
+    table_key = (schema_name, table_name)
+    enable_rls = False
+    if table_key not in rls_enabled_tables:
+        enable_rls = True
+        rls_enabled_tables.add(table_key)
+
     code = template_def.format(
         varname=varname,
         schema=schema_name,
         signature=signature,
         definition=definition,
         on_entity=on_entity,
+        enable_rls=enable_rls,
     )
     return code, varname
 
@@ -762,7 +773,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         self,
         template: str,
         statement: str,
-        parse_row_func: Callable[[dict[str, Any], str, str], str],
+        parse_row_func: Callable[..., tuple[str, str] | None],
         entities_varname: str,
         schema: str = "public",
     ) -> list[str]:
@@ -782,14 +793,29 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             raise ValueError(f"Unknown template: {template}")
 
         result: list[dict[str, Any]] = fetch_all_mappings(conn, sql, {"schema": schema})
-        entities: list[str] = [
-            parsed
-            for row in result
-            if (parsed := parse_row_func(row, template_def, schema)) is not None
-        ]
+        entities: list[tuple[str, str]]
 
-        code = [code for code, _ in entities]  # type: ignore  # noqa: PGH003
-        varnames = [varnames for _, varnames in entities]  # type: ignore  # noqa: PGH003
+        if parse_row_func.__name__ == "parse_policy_row":
+            rls_enabled_tables: set[tuple[str, str]] = set()
+            entities = [
+                parsed
+                for row in result
+                if (
+                    parsed := parse_row_func(
+                        row, template_def, schema, rls_enabled_tables
+                    )
+                )
+                is not None
+            ]
+        else:
+            entities = [
+                parsed
+                for i, row in enumerate(result)
+                if (parsed := parse_row_func(row, template_def, schema)) is not None
+            ]
+
+        code = [code for code, _ in entities]
+        varnames = [varname for _, varname in entities]
         return finalize_alembic_utils(
             code,
             varnames,
