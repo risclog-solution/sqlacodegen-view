@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sqlacodegen.generators import TablesGenerator
 
 EXCLUDED_TABLES = {"tmp_functest", "accesslogfailed"}
+INCLUDED_POLICY_ROLES = {"brokeruser"}
 BASE_META_DATA = Base(
     literal_imports=[
         LiteralImport(
@@ -67,6 +68,7 @@ ALEMBIC_POLICIES_TEMPLATE = """{varname} = PGPolicy(
     signature={signature!r},
     definition=\"\"\"{definition}\"\"\",
     on_entity={on_entity!r},
+    enable_rls={enable_rls}
 )
 """
 ALEMBIC_TRIGGER_TEMPLATE = """{varname} = PGTrigger(
@@ -78,10 +80,11 @@ ALEMBIC_TRIGGER_TEMPLATE = """{varname} = PGTrigger(
 ALEMBIC_AGGREGATE_TEMPLATE = """{varname} = PGAggregate(
     schema={schema!r},
     signature={signature!r},
-    sfunc={sfunc!r},
-    stype={stype!r},
-    finalfunc={finalfunc!r},
-    initcond={initcond!r},
+    definition={definition!r},
+    _sfunc={sfunc!r},
+    _stype={stype!r},
+    _initcond={initcond!r},
+    _finalfunc={finalfunc!r},
 )
 """
 ALEMBIC_EXTENSION_TEMPLATE = """{varname} = PGExtension(
@@ -93,14 +96,10 @@ ALEMBIC_EXTENSION_TEMPLATE = """{varname} = PGExtension(
 ALEMBIC_SEQUENCE_TEMPLATE = """{varname} = PGSequence(
     schema={schema!r},
     signature={signature!r},
-    data_type={data_type!r},
-    start_value={start_value},
-    minvalue={minimum_value},
-    maxvalue={maximum_value},
-    increment={increment},
-    cycle={cycle},
+    definition=\"\"\"{definition}\"\"\",
 )
 """
+
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
 FROM
@@ -121,20 +120,41 @@ ORDER BY
     n.nspname,
     p.proname;
 """
+
+
 ALEMBIC_POLICIES_STATEMENT = """SELECT
     pol.polname AS policy_name,
+    ns.nspname AS schema_name,
     c.relname AS table_name,
+    'FOR ' ||
+      CASE pol.polcmd
+        WHEN 'r' THEN 'SELECT'
+        WHEN 'a' THEN 'ALL'
+        WHEN 'w' THEN 'UPDATE'
+        WHEN 'u' THEN 'UPDATE'
+        WHEN 'd' THEN 'DELETE'
+        WHEN 'i' THEN 'INSERT'
+        ELSE '[' || pol.polcmd || ']'
+      END
+    || ' TO ' ||
+      COALESCE(
+        string_agg(r.rolname, ', ' ORDER BY r.rolname),
+        'PUBLIC'
+      ) AS for_to_clause,
+    pol.polcmd,
     pg_get_expr(pol.polqual, pol.polrelid) AS using_clause,
-    pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check,
-    pol.polcmd AS command,
-    pol.polroles AS roles
+    pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check
 FROM
     pg_policy pol
     JOIN pg_class c ON pol.polrelid = c.oid
     JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    LEFT JOIN unnest(pol.polroles) AS r_oid ON TRUE
+    LEFT JOIN pg_roles r ON r.oid = r_oid
 WHERE
-    ns.nspname = 'public';
-"""
+    ns.nspname = 'public'
+GROUP BY pol.polname, ns.nspname, c.relname, pol.polcmd, pol.polrelid, pol.polqual, pol.polwithcheck
+ORDER BY policy_name;  """
+
 ALEMBIC_TRIGGER_STATEMENT = """SELECT
     trg.tgname AS trigger_name,
     tbl.relname AS table_name,
@@ -191,18 +211,24 @@ FROM pg_extension
 JOIN pg_namespace ON pg_extension.extnamespace = pg_namespace.oid
 ORDER BY extname;
 """
-ALEMBIC_SEQUENCE_STATEMENT = """SELECT
-    sequence_schema AS schema,
-    sequence_name,
-    data_type,
-    start_value,
-    minimum_value,
-    maximum_value,
-    increment,
-    cycle_option AS cycle
-FROM information_schema.sequences
-WHERE sequence_schema NOT IN ('pg_catalog', 'information_schema')
-ORDER BY sequence_schema, sequence_name;
+
+ALEMBIC_SEQUENCE_STATEMENT = """
+SELECT
+    s.sequence_schema AS schema,
+    s.sequence_name,
+    s.data_type,
+    s.start_value,
+    s.minimum_value,
+    s.maximum_value,
+    s.increment,
+    s.cycle_option AS cycle,
+    ps.cache_size
+FROM information_schema.sequences s
+JOIN pg_catalog.pg_sequences ps
+      ON s.sequence_schema = ps.schemaname
+     AND s.sequence_name = ps.sequencename
+WHERE s.sequence_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY s.sequence_schema, s.sequence_name;
 """
 
 
@@ -266,39 +292,46 @@ def parse_function_row(
 
 
 def parse_policy_row(
-    policy: dict[str, Any], template_def: str, schema: str | None
-) -> tuple[str, str]:
+    policy: dict[str, Any],
+    template_def: str,
+    schema: str | None,
+    rls_enabled_tables: set[tuple[str, str]],
+) -> tuple[str, str] | None:
     policy_name = policy["policy_name"]
+    schema_name = policy.get("schema_name", schema) or "public"
     table_name = policy["table_name"]
-    using = f"USING ({policy['using_clause']})" if policy.get("using_clause") else ""
-    check = f"WITH CHECK ({policy['with_check']})" if policy.get("with_check") else ""
 
-    roles_list = policy.get("roles")
-    if isinstance(roles_list, str):
-        roles = f'"{roles_list}"'
-    elif roles_list:
-        roles = ", ".join(f'"{r}"' for r in roles_list)
-    else:
-        roles = "PUBLIC"
+    for_to_clause = policy.get("for_to_clause", "")
 
-    if not using and not check:
-        definition = f"FOR {policy['command']} TO {roles}"
-    else:
-        definition = f"FOR {policy['command']} TO {roles} {using} {check}"
-    definition = re.sub(r"\s+", " ", definition)
-    definition = definition.rstrip() + " "
+    match = re.search(r"TO\s+([a-zA-Z0-9_,\s]+)", for_to_clause)
+    if match:
+        roles_raw = match.group(1)
+        roles = [r.strip().lower() for r in roles_raw.split(",")]
+        if any(role not in INCLUDED_POLICY_ROLES for role in roles):
+            return None
 
-    schema = schema or "public"
+    using = f" USING ({policy['using_clause']})" if policy.get("using_clause") else ""
+    check = f" WITH CHECK ({policy['with_check']})" if policy.get("with_check") else ""
+
+    definition = f"{for_to_clause}{using}{check}".strip()
+
     signature = f"{policy_name}.{table_name}"
-    on_entity = f"{schema}.{table_name}"
+    on_entity = f"{schema_name}.{table_name}"
     varname = f"{policy_name}_{table_name}".lower()
+
+    table_key = (schema_name, table_name)
+    enable_rls = False
+    if table_key not in rls_enabled_tables:
+        enable_rls = True
+        rls_enabled_tables.add(table_key)
 
     code = template_def.format(
         varname=varname,
-        schema=schema,
+        schema=schema_name,
         signature=signature,
         definition=definition,
         on_entity=on_entity,
+        enable_rls=enable_rls,
     )
     return code, varname
 
@@ -329,19 +362,32 @@ def parse_aggregate_row(
 ) -> tuple[str, str]:
     aggregate_name = row["aggregate_name"]
     args = row.get("args", "")
-    sfunc = row.get("sfunc", None)
-    stype = row.get("stype", None)
-    finalfunc = row.get("finalfunc", None)
-    initcond = row.get("initcond", None)
-    schema = schema or row.get("schema") or "public"
+    sfunc = row.get("sfunc")
+    stype = row.get("stype")
+    finalfunc = row.get("finalfunc")
+    initcond = row.get("initcond")
+    schema_val = schema or row.get("schema") or "public"
+
+    # Baue die Definition als lesbare String-Config:
+    definition_parts = []
+    if sfunc:
+        definition_parts.append(f"SFUNC = {sfunc}")
+    if stype:
+        definition_parts.append(f"STYPE = {stype}")
+    if finalfunc:
+        definition_parts.append(f"FINALFUNC = {finalfunc}")
+    if initcond:
+        definition_parts.append(f"INITCOND = {initcond}")
+    definition = ", ".join(definition_parts)
 
     signature = f"{aggregate_name}({args})"
     varname = f"{aggregate_name}".lower()
 
     code = template_def.format(
         varname=varname,
-        schema=schema,
+        schema=schema_val,
         signature=signature,
+        definition=definition,
         sfunc=sfunc,
         stype=stype,
         finalfunc=finalfunc,
@@ -366,19 +412,28 @@ def parse_extension_row(
 def parse_sequence_row(
     row: dict[str, Any], template_def: str, schema: str | None
 ) -> tuple[str, str]:
-    cycle = row["cycle"].upper() in ("YES", "true", "TRUE", "on", "ON", "1")
-    varname = f"{row['sequence_name']}_sequence".lower()
+    schema_val = row["schema"] or schema or "public"
     signature = row["sequence_name"]
+    varname = f"{signature}_sequence".lower()
+
+    parts = [
+        f"AS {row['data_type']}",
+        f"START WITH {row['start_value']}",
+        f"INCREMENT BY {row['increment']}",
+        f"MINVALUE {row['minimum_value']}",
+        f"MAXVALUE {row['maximum_value']}",
+        f"CACHE {row['cache_size']}",
+        "CYCLE"
+        if str(row.get("cycle", "")).lower() in ("yes", "true", "on", "1")
+        else "NO CYCLE",
+    ]
+    definition = "\n    ".join(parts)
+
     code = template_def.format(
         varname=varname,
-        schema=row["schema"] or schema or "public",
+        schema=schema_val,
         signature=signature,
-        data_type=row["data_type"],
-        start_value=row["start_value"],
-        minimum_value=row["minimum_value"],
-        maximum_value=row["maximum_value"],
-        increment=row["increment"],
-        cycle=cycle,
+        definition=definition,
     )
     return code, varname
 
@@ -718,7 +773,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         self,
         template: str,
         statement: str,
-        parse_row_func: Callable[[dict[str, Any], str, str], str],
+        parse_row_func: Callable[..., tuple[str, str] | None],
         entities_varname: str,
         schema: str = "public",
     ) -> list[str]:
@@ -738,12 +793,29 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             raise ValueError(f"Unknown template: {template}")
 
         result: list[dict[str, Any]] = fetch_all_mappings(conn, sql, {"schema": schema})
-        entities: list[str] = [
-            parse_row_func(row, template_def, schema) for row in result
-        ]
+        entities: list[tuple[str, str]]
 
-        code = [code for code, _ in entities]  # type: ignore  # noqa: PGH003
-        varnames = [varnames for _, varnames in entities]  # type: ignore  # noqa: PGH003
+        if parse_row_func.__name__ == "parse_policy_row":
+            rls_enabled_tables: set[tuple[str, str]] = set()
+            entities = [
+                parsed
+                for row in result
+                if (
+                    parsed := parse_row_func(
+                        row, template_def, schema, rls_enabled_tables
+                    )
+                )
+                is not None
+            ]
+        else:
+            entities = [
+                parsed
+                for i, row in enumerate(result)
+                if (parsed := parse_row_func(row, template_def, schema)) is not None
+            ]
+
+        code = [code for code, _ in entities]
+        varnames = [varname for _, varname in entities]
         return finalize_alembic_utils(
             code,
             varnames,
@@ -787,7 +859,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             inspector = inspect(self.bind)
             view_def = inspector.get_view_definition(table.name, table.schema)
         view_def = (view_def or "").strip()
-        view_def = squash_whitespace(view_def)
 
         self.add_literal_import("sqlalchemy.dialects.postgresql", "UUID as SA_UUID")
         self.add_literal_import("uuid", "uuid4")
