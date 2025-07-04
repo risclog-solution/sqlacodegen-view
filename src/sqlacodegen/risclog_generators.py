@@ -6,6 +6,7 @@ from sqlalchemy import (
     Column,
     ForeignKeyConstraint,
     Index,
+    MetaData,
     PrimaryKeyConstraint,
     Table,
     UniqueConstraint,
@@ -345,12 +346,18 @@ def parse_trigger_row(
     schema_val = schema or "public"
 
     varname = f"{trigger_name}_{table_name}".lower()
-    signature = trigger_name  
-    def extract_pgtrigger_definition(trigger_def, trigger_name):
-        m = re.search(rf"CREATE\s+TRIGGER\s+{re.escape(trigger_name)}\s+(.*)", trigger_def, re.IGNORECASE | re.DOTALL)
+    signature = trigger_name
+
+    def extract_pgtrigger_definition(trigger_def: str, trigger_name: str) -> str:
+        m = re.search(
+            rf"CREATE\s+TRIGGER\s+{re.escape(trigger_name)}\s+(.*)",
+            trigger_def,
+            re.IGNORECASE | re.DOTALL,
+        )
         if m:
             return m.group(1).strip()
         return trigger_def.strip()
+
     definition = extract_pgtrigger_definition(trigger["trigger_def"], trigger_name)
     on_entity = f"{schema_val}.{table_name}"
 
@@ -362,6 +369,7 @@ def parse_trigger_row(
         on_entity=on_entity,
     )
     return code, varname
+
 
 def parse_aggregate_row(
     row: dict[str, str], template_def: str, schema: str | None
@@ -773,18 +781,20 @@ def clx_generate(self: "TablesGenerator") -> tuple[str, list[str] | None]:
 
 TablesGenerator.generate = clx_generate  # type: ignore[assignment]
 
-def get_table_managed_sequences(metadata):
+
+def get_table_managed_sequences(metadata: MetaData) -> set[str]:
     seq_names = set()
     for table in metadata.tables.values():
         for column in table.columns:
-            default = getattr(column, 'default', None)
+            default = getattr(column, "default", None)
             if default is not None:
                 # Sequence kann als Default o. direkt als ServerDefault hinterlegt sein
-                if hasattr(default, 'name'):
+                if hasattr(default, "name"):
                     seq_names.add(default.name)
-            if hasattr(column, 'sequence') and column.sequence is not None:
+            if hasattr(column, "sequence") and column.sequence is not None:
                 seq_names.add(column.sequence.name)
     return seq_names
+
 
 class DeclarativeGeneratorWithViews(DeclarativeGenerator):
     def generate_alembic_utils_sequences(
@@ -810,7 +820,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         entities = [
             parsed
             for row in result
-            if row["sequence_name"] not in managed and (parsed := parse_row_func(row, template_def, schema)) is not None
+            if row["sequence_name"] not in managed
+            and (parsed := parse_row_func(row, template_def, schema)) is not None
         ]
 
         code = [code for code, _ in entities]
@@ -877,7 +888,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         classname = "".join(x.capitalize() for x in table.name.split("_"))
         if not classname.endswith("View"):
             classname += "View"
-        
+
         columns = []
         has_id = False
 
@@ -969,10 +980,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
     def generate_base(self) -> None:
         self.base = BASE_META_DATA
 
-    
-    def render_models(self, models: list[Model]) -> tuple[str, list[str] | None]: # type: ignore[override]
-
-    
+    def render_models(self, models: list[Model]) -> tuple[str, list[str] | None]:  # type: ignore[override]
         rendered: list[str] = []
         pg_alembic_definition = []
         entities = []
@@ -1009,10 +1017,13 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         }
 
         # Ergänzung: Ermittlung aller Extension-Objekte (Tabellen, Views, etc.)
-        def get_extension_object_names(conn, schemas):
+        def get_extension_object_names(
+            conn: Connection, schemas: set[str | None]
+        ) -> Any:
             extension_objs = set()
             for schema in schemas:
-                result = conn.execute(text(f"""
+                result = conn.execute(
+                    text("""
                     SELECT c.relname
                     FROM pg_class c
                     JOIN pg_namespace n ON c.relnamespace = n.oid
@@ -1023,7 +1034,9 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                         JOIN pg_extension e ON d.refobjid = e.oid
                         WHERE d.objid = c.oid AND d.deptype = 'e'
                     )
-                """), {'schema': schema})
+                """),
+                    {"schema": schema},
+                )
                 extension_objs |= {row[0] for row in result}
             return extension_objs
 
@@ -1093,7 +1106,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 if not classname.endswith("View"):
                     classname += "View"
                 all.append(classname)
-                
+
                 pg_alembic_definition.append(pg_alembic)
                 entities.append(table.name)
                 entities_name = "all_views"
@@ -1102,11 +1115,11 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             elif table is not None and isinstance(model, ModelClass):
                 self.base_class_name = "PortalObject"
                 all.append(model.name)
-            
+
                 rendered.append(self.render_class(model))
             elif table is not None:
                 rendered.append(f"{model.name} = {self.render_table(model.table)}")
-        
+
         rendered.append(f"__all__ = {all}")
         for typ in sorted(used_types):
             if typ in type_imports:
