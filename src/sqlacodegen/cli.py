@@ -302,25 +302,43 @@ def main() -> None:
         file_name = export["file"]
 
         if args.outfile_dir:
-            generator_functions = generator_tables.generate_alembic_utils_entities(
-                template=template,
-                statement=statement,
-                parse_row_func=parse_row_func,
-                schema=args.schemas or "public",
-                entities_varname=entities_varname,
-            )
+            if title == "Sequences":
+                generator_functions = generator_tables.generate_alembic_utils_sequences(
+                    template=template,
+                    statement=statement,
+                    parse_row_func=parse_row_func,
+                    schema=args.schemas or "public",
+                    entities_varname=entities_varname,
+                )
+            else:
+                generator_functions = generator_tables.generate_alembic_utils_entities(
+                    template=template,
+                    statement=statement,
+                    parse_row_func=parse_row_func,
+                    schema=args.schemas or "public",
+                    entities_varname=entities_varname,
+                )
             dest_pg_path = Path(str(parent), str(file_name))
             with open(dest_pg_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(generator_functions))
             print(f"{title} geschrieben nach: {dest_pg_path.as_posix()}")
         else:
-            generator_functions = generator_tables.generate_alembic_utils_entities(
-                template=template,
-                statement=statement,
-                parse_row_func=parse_row_func,
-                schema=args.schemas or "public",
-                entities_varname=entities_varname,
-            )
+            if title == "Sequences":
+                generator_functions = generator_tables.generate_alembic_utils_sequences(
+                    template=template,
+                    statement=statement,
+                    parse_row_func=parse_row_func,
+                    schema=args.schemas or "public",
+                    entities_varname=entities_varname,
+                )
+            else:
+                generator_functions = generator_tables.generate_alembic_utils_entities(
+                    template=template,
+                    statement=statement,
+                    parse_row_func=parse_row_func,
+                    schema=args.schemas or "public",
+                    entities_varname=entities_varname,
+                )
             print(f"### {title.upper()} ###")
             print(generator_functions)
 
