@@ -1139,7 +1139,7 @@ class DeclarativeGenerator(TablesGenerator):
         rendered_sections = "\n\n".join(
             indent(section, self.indentation) for section in sections
         )
-        return f"{declaration}\n{rendered_sections}"
+        return f"{declaration}  # type: ignore[misc]\n{rendered_sections}"
 
     def render_class_declaration(self, model: ModelClass) -> str:
         parent_class_name = (
