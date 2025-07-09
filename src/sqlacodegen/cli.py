@@ -31,7 +31,6 @@ from sqlacodegen.risclog_generators import (
     parse_extension_row,
     parse_function_row,
     parse_policy_row,
-    parse_sequence_row,
     parse_trigger_row,
 )
 from sqlacodegen.seed_export import export_pgdata_py, get_table_dependency_order
@@ -245,14 +244,6 @@ def main() -> None:
             "statement": "ALEMBIC_EXTENSION_STATEMENT",
             "parse_row_func": parse_extension_row,
             "file": "pg_extensions.py",
-        },
-        {
-            "title": "Sequences",
-            "entities_varname": "all_sequences",
-            "template": "ALEMBIC_SEQUENCE_TEMPLATE",
-            "statement": "ALEMBIC_SEQUENCE_STATEMENT",
-            "parse_row_func": parse_sequence_row,
-            "file": "pg_sequences.py",
         },
     ]
 

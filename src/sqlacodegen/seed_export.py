@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import MetaData, select, text
+from sqlalchemy import MetaData, select
 from sqlalchemy.engine import Engine
 
 
@@ -111,33 +111,11 @@ def export_pgdata_py(
                 result.append(d)
             data[name] = result
 
-        sequence_rows = conn.execute(
-            text("""
-            SELECT sequence_schema, sequence_name
-            FROM information_schema.sequences
-            WHERE sequence_schema NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY sequence_schema, sequence_name
-            """)
-        ).fetchall()
-        raw_sql_stmts = []
-        for row in sequence_rows:
-            schema = row.sequence_schema
-            seq_name = row.sequence_name
-            lastval = conn.execute(
-                text(f"SELECT last_value FROM {schema}.{seq_name}")
-            ).scalar()
-            raw_sql_stmts.append(
-                f"        SELECT setval('{schema}.{seq_name}', {lastval}, false);"
-            )
-        raw_sql_str = "\n".join(raw_sql_stmts)
-
     seed_block, imports = data_as_code(data)
     lines: list[str] = []
     for imp in sorted(imports):
         lines.append(imp)
     lines.append("\n\nall_seeds = {\n" + seed_block + "\n}")
-
-    lines.append('\nall_seeds[\'sql_next_values\'] = """\n' + raw_sql_str + '\n"""\n')
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
