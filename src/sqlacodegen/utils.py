@@ -17,7 +17,10 @@ from sqlalchemy.sql.schema import (
     Table,
 )
 
-_re_postgresql_nextval_sequence = re.compile(r"nextval\('(.+)'::regclass\)")
+_re_postgresql_nextval_sequence = re.compile(
+    r"nextval\(\(?'(?P<seq>[\w\.]+)'(::text)?\)?::regclass\)"
+)
+
 _re_postgresql_sequence_delimiter = re.compile(r'(.*?)([."]|$)')
 
 

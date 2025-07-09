@@ -1,10 +1,13 @@
 import re
 from pprint import pformat
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from sqlalchemy import (
     Column,
+    Computed,
+    DefaultClause,
     ForeignKeyConstraint,
+    Identity,
     Index,
     MetaData,
     PrimaryKeyConstraint,
@@ -12,10 +15,11 @@ from sqlalchemy import (
     UniqueConstraint,
     inspect,
     text,
-    types,
 )
 from sqlalchemy import types as satypes
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.sql.elements import TextClause
+from sqlalchemy.sql.functions import next_value
 
 from sqlacodegen.generators import (
     Base,
@@ -34,7 +38,7 @@ if TYPE_CHECKING:
     from sqlacodegen.generators import TablesGenerator
 
 EXCLUDED_TABLES = {"tmp_functest", "accesslogfailed"}
-INCLUDED_POLICY_ROLES = {"brokeruser"}
+INCLUDED_POLICY_ROLES = {"brokeruser", " clx_readonly", "clx"}
 BASE_META_DATA = Base(
     literal_imports=[
         LiteralImport(
@@ -229,7 +233,15 @@ FROM information_schema.sequences s
 JOIN pg_catalog.pg_sequences ps
       ON s.sequence_schema = ps.schemaname
      AND s.sequence_name = ps.sequencename
-WHERE s.sequence_schema NOT IN ('pg_catalog', 'information_schema')
+JOIN pg_class t
+    ON t.relkind = 'r' AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.sequence_schema)
+JOIN pg_attribute a
+    ON a.attrelid = t.oid
+JOIN pg_attrdef d
+    ON d.adrelid = t.oid AND d.adnum = a.attnum
+WHERE
+    s.sequence_schema NOT IN ('pg_catalog', 'information_schema')
+    AND pg_get_expr(d.adbin, d.adrelid) LIKE '%nextval(%' || s.sequence_name || '%'
 ORDER BY s.sequence_schema, s.sequence_name;
 """
 
@@ -428,7 +440,7 @@ def parse_sequence_row(
 ) -> tuple[str, str]:
     schema_val = row["schema"] or schema or "public"
     signature = row["sequence_name"]
-    varname = f"{signature}_sequence".lower()
+    varname = signature.lower()
 
     parts = [
         f"AS {row['data_type']}",
@@ -644,9 +656,9 @@ def clx_render_index(self: "TablesGenerator", index: Index) -> str:
                 and hasattr(col, "type")
             ):
                 coltype = getattr(col.type, "python_type", None)
-                if isinstance(col.type, (types.String, types.Text, types.Unicode)) or (
-                    coltype and coltype is str
-                ):
+                if isinstance(
+                    col.type, (satypes.String, satypes.Text, satypes.Unicode)
+                ) or (coltype and coltype is str):
                     opclass_map[col.name] = "gin_trgm_ops"
 
     elif getattr(index, "expressions", None):
@@ -725,6 +737,117 @@ def clx_render_table(self: "TablesGenerator", table: Table) -> str:
 
 
 TablesGenerator.render_table = clx_render_table  # type: ignore[method-assign]
+
+
+def clx_render_column(
+    self: "TablesGenerator",
+    column: Column[Any],
+    show_name: bool,
+    is_table: bool = False,
+) -> str:
+    args = []
+    kwargs: dict[str, Any] = {}
+    kwarg = []
+    is_sole_pk = column.primary_key and len(column.table.primary_key) == 1
+    dedicated_fks = [
+        c
+        for c in column.foreign_keys
+        if c.constraint
+        and len(c.constraint.columns) == 1
+        and uses_default_name(c.constraint)
+    ]
+    is_unique = any(
+        isinstance(c, UniqueConstraint)
+        and set(c.columns) == {column}
+        and uses_default_name(c)
+        for c in column.table.constraints
+    )
+    is_unique = is_unique or any(
+        i.unique and set(i.columns) == {column} and uses_default_name(i)
+        for i in column.table.indexes
+    )
+    is_primary = (
+        any(
+            isinstance(c, PrimaryKeyConstraint)
+            and column.name in c.columns
+            and uses_default_name(c)
+            for c in column.table.constraints
+        )
+        or column.primary_key
+    )
+    has_index = any(
+        set(i.columns) == {column} and uses_default_name(i)
+        for i in column.table.indexes
+    )
+
+    if show_name:
+        args.append(repr(column.name))
+
+    # Render the column type if there are no foreign keys on it or any of them
+    # points back to itself
+    if not dedicated_fks or any(fk.column is column for fk in dedicated_fks):
+        args.append(self.render_column_type(column.type))
+
+    for fk in dedicated_fks:
+        args.append(self.render_constraint(fk))
+
+    if column.default is not None:
+        args.append(repr(column.default))
+
+    if column.key != column.name:
+        kwargs["key"] = column.key
+    if is_primary:
+        kwargs["primary_key"] = True
+    if not column.nullable and not is_sole_pk and is_table:
+        kwargs["nullable"] = False
+
+    if is_unique:
+        column.unique = True
+        kwargs["unique"] = True
+    if has_index:
+        column.index = True
+        kwarg.append("index")
+        kwargs["index"] = True
+
+    # --- SERVER DEFAULT HANDLING ---
+    if isinstance(column.server_default, DefaultClause):
+        kwargs["server_default"] = render_callable(
+            "text", repr(cast(TextClause, column.server_default.arg).text)
+        )
+    elif isinstance(column.server_default, Computed):
+        expression = str(column.server_default.sqltext)
+
+        computed_kwargs = {}
+        if column.server_default.persisted is not None:
+            computed_kwargs["persisted"] = column.server_default.persisted
+
+        args.append(
+            render_callable("Computed", repr(expression), kwargs=computed_kwargs)
+        )
+    elif isinstance(column.server_default, Identity):
+        args.append(repr(column.server_default))
+    elif isinstance(column.server_default, next_value):
+        # --------- NEU: Sequence/next_value ----------
+        seq = column.server_default.sequence
+        if seq is not None:
+            default_schema = "public"
+            kwargs["server_default"] = (
+                f"Sequence({seq.name!r}{f', schema={seq.schema!r}' if seq.schema else f', schema={default_schema!r}'}).next_value()"
+            )
+        else:
+            kwargs["server_default"] = "None  # Sequence not detected"
+    elif column.server_default is not None:
+        kwargs["server_default"] = repr(column.server_default)
+    # -----------------------------------------------
+
+    comment = getattr(column, "comment", None)
+    if comment:
+        kwargs["comment"] = repr(comment)
+
+    return self.render_column_callable(is_table, *args, **kwargs)
+
+
+TablesGenerator.render_column = clx_render_column  # type: ignore[method-assign]
 
 
 def clx_generate(self: "TablesGenerator") -> tuple[str, list[str] | None]:
@@ -816,12 +939,10 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         # Hole alle aus DB
         result: list[dict[str, Any]] = fetch_all_mappings(conn, sql, {"schema": schema})
         # Finde alle, die von Tables verwaltet werden
-        managed = get_table_managed_sequences(self.metadata)
         entities = [
             parsed
             for row in result
-            if row["sequence_name"] not in managed
-            and (parsed := parse_row_func(row, template_def, schema)) is not None
+            if (parsed := parse_row_func(row, template_def, schema)) is not None
         ]
 
         code = [code for code, _ in entities]
@@ -1127,6 +1248,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 self.add_literal_import(module, name)
 
         self.add_literal_import("sqlalchemy", "text")
+        self.add_literal_import("sqlalchemy", "FetchedValue")
 
         return "\n\n".join(rendered), finalize_alembic_utils(
             pg_alembic_definition, entities, entities_name

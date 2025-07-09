@@ -41,6 +41,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import DOMAIN, JSONB
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import CompileError
+from sqlalchemy.schema import Sequence as SASequence
 from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.sql.type_api import UserDefinedType
 from sqlalchemy.types import TypeEngine
@@ -231,10 +232,10 @@ class TablesGenerator(CodeGenerator):
         elif isinstance(column.type, DOMAIN):
             self.add_import(column.type.data_type.__class__)
 
-        if column.default:
+        if column.default is not None:
             self.add_import(column.default)
 
-        if column.server_default:
+        if column.server_default is not None:
             if isinstance(column.server_default, (Computed, Identity)):
                 self.add_import(column.server_default)
             elif isinstance(column.server_default, DefaultClause):
@@ -449,7 +450,7 @@ class TablesGenerator(CodeGenerator):
         for fk in dedicated_fks:
             args.append(self.render_constraint(fk))
 
-        if column.default:
+        if column.default is not None:
             args.append(repr(column.default))
 
         if column.key != column.name:
@@ -483,7 +484,7 @@ class TablesGenerator(CodeGenerator):
             )
         elif isinstance(column.server_default, Identity):
             args.append(repr(column.server_default))
-        elif column.server_default:
+        elif column.server_default is not None:
             kwargs["server_default"] = repr(column.server_default)
 
         comment = getattr(column, "comment", None)
@@ -624,6 +625,24 @@ class TablesGenerator(CodeGenerator):
 
         return name
 
+    def get_pg_sequence_parameters(
+        self, bind: Engine, schema: str, name: str
+    ) -> dict[str, Any]:
+        sql = """
+            SELECT start_value, increment_by, min_value, max_value
+            FROM pg_sequences
+            WHERE schemaname = :schema AND sequencename = :name
+        """
+        with bind.connect() as conn:
+            row = (
+                conn.execute(
+                    sqlalchemy.text(sql), {"schema": schema or "public", "name": name}
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row else {}
+
     def fix_column_types(self, table: Table) -> None:
         """Adjust the reflected column types."""
         # Detect check constraints for boolean and enum columns
@@ -667,7 +686,10 @@ class TablesGenerator(CodeGenerator):
                 pass
 
             # PostgreSQL specific fix: detect sequences from server_default
-            if column.server_default and self.bind.dialect.name == "postgresql":
+            if (
+                column.server_default is not None
+                and self.bind.dialect.name == "postgresql"
+            ):
                 if isinstance(column.server_default, DefaultClause) and isinstance(
                     column.server_default.arg, TextClause
                 ):
@@ -675,11 +697,9 @@ class TablesGenerator(CodeGenerator):
                         column.server_default.arg
                     )
                     if seqname:
-                        # Add an explicit sequence
-                        if seqname != f"{column.table.name}_{column.name}_seq":
-                            column.default = sqlalchemy.Sequence(seqname, schema=schema)
-
-                        column.server_default = None
+                        column.default = SASequence(
+                            name=seqname, schema=schema, start=1, increment=1
+                        )
 
     def get_adapted_type(self, coltype: Any) -> Any:
         compiled_type = coltype.compile(self.bind.engine.dialect)
