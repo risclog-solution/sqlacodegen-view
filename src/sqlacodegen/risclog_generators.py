@@ -642,64 +642,123 @@ def clx_generate_base(self: "TablesGenerator") -> None:
 TablesGenerator.generate_base = clx_generate_base  # type: ignore[method-assign]
 
 
+# def clx_render_index(self: "TablesGenerator", index: Index) -> str:
+#     elements = []
+#     opclass_map = {}
+
+#     if index.columns:
+#         for col in index.columns:
+#             elements.append(repr(col.name))
+
+#             if (
+#                 "postgresql" in index.dialect_options
+#                 and index.dialect_options["postgresql"].get("using") == "gin"
+#                 and hasattr(col, "type")
+#             ):
+#                 coltype = getattr(col.type, "python_type", None)
+#                 if isinstance(
+#                     col.type, (satypes.String, satypes.Text, satypes.Unicode)
+#                 ) or (coltype and coltype is str):
+#                     opclass_map[col.name] = "gin_trgm_ops"
+
+#     elif getattr(index, "expressions", None):
+#         for expr in index.expressions:
+#             expr_str = str(expr).strip()
+#             elements.append(f"text({expr_str!r})")
+
+#             if (
+#                 "postgresql" in index.dialect_options
+#                 and index.dialect_options["postgresql"].get("using") == "gin"
+#             ):
+#                 if (
+#                     "::tsvector" not in expr_str
+#                     and "array" not in expr_str.lower()
+#                     and "json" not in expr_str.lower()
+#                 ):
+#                     opclass_map[expr_str] = "gin_trgm_ops"
+
+#     if not elements:
+#         print(
+#             f"# WARNING: Skipped index {getattr(index, 'name', None)!r} on table {getattr(index.table, 'name', None)!r} (no columns or expressions)."
+#         )
+#         return ""
+
+#     kwargs: dict[str, Any] = {}
+
+#     if index.unique:
+#         kwargs["unique"] = True
+
+#     if "postgresql" in index.dialect_options:
+#         dialect_opts = index.dialect_options["postgresql"]
+#         if "using" in dialect_opts:
+#             using = dialect_opts["using"]
+#             kwargs["postgresql_using"] = (
+#                 f"'{using}'" if isinstance(using, str) else using
+#             )
+
+#         if opclass_map:
+#             kwargs["postgresql_ops"] = opclass_map
+
+#     return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
+
+RAW_SQL_INDEXES = []
+
 def clx_render_index(self: "TablesGenerator", index: Index) -> str:
-    elements = []
-    opclass_map = {}
-
-    if index.columns:
-        for col in index.columns:
-            elements.append(repr(col.name))
-
-            if (
-                "postgresql" in index.dialect_options
-                and index.dialect_options["postgresql"].get("using") == "gin"
-                and hasattr(col, "type")
-            ):
+    """
+    Render SQLAlchemy Index for ORM if possible, otherwise collect as RAW SQL.
+    """
+    # Normale Spaltenindizes
+    if index.columns and all(hasattr(col, "name") for col in index.columns):
+        opclass_map = {}
+        elements = [repr(col.name) for col in index.columns]
+        # GIN + Operator für Textspalten
+        if (
+            "postgresql" in index.dialect_options
+            and index.dialect_options["postgresql"].get("using") == "gin"
+        ):
+            for col in index.columns:
                 coltype = getattr(col.type, "python_type", None)
-                if isinstance(
-                    col.type, (satypes.String, satypes.Text, satypes.Unicode)
-                ) or (coltype and coltype is str):
+                if (
+                    isinstance(col.type, (satypes.String, satypes.Text, satypes.Unicode))
+                    or (coltype and coltype is str)
+                ):
                     opclass_map[col.name] = "gin_trgm_ops"
 
-    elif getattr(index, "expressions", None):
-        for expr in index.expressions:
-            expr_str = str(expr).strip()
-            elements.append(f"text({expr_str!r})")
+        kwargs = {}
+        if index.unique:
+            kwargs["unique"] = True
+        if "postgresql" in index.dialect_options:
+            using = index.dialect_options["postgresql"].get("using")
+            if using:
+                kwargs["postgresql_using"] = f"'{using}'"
+            if opclass_map:
+                kwargs["postgresql_ops"] = opclass_map
 
-            if (
-                "postgresql" in index.dialect_options
-                and index.dialect_options["postgresql"].get("using") == "gin"
-            ):
-                if (
-                    "::tsvector" not in expr_str
-                    and "array" not in expr_str.lower()
-                    and "json" not in expr_str.lower()
-                ):
-                    opclass_map[expr_str] = "gin_trgm_ops"
+        return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
 
-    if not elements:
-        print(
-            f"# WARNING: Skipped index {getattr(index, 'name', None)!r} on table {getattr(index.table, 'name', None)!r} (no columns or expressions)."
+    # Ausdrücke im Index? (text/func etc.)
+    expressions = getattr(index, "expressions", None)
+    if expressions:
+        is_gin = (
+            "postgresql" in index.dialect_options
+            and index.dialect_options["postgresql"].get("using") == "gin"
         )
+        for expr in expressions:
+            expr_str = str(expr).strip()
+            table_name = getattr(index.table, "name", "<unknown_table>")
+            if is_gin:
+                # GIN-Index auf Ausdruck – RAW SQL
+                sql = f"CREATE INDEX {index.name} ON {table_name} USING gin ({expr_str} gin_trgm_ops);"
+            else:
+                # Sonstige Index-Typen auf Ausdruck
+                sql = f"CREATE INDEX {index.name} ON {table_name} ({expr_str});"
+            RAW_SQL_INDEXES.append(sql)
+        # Niemals als Python-Index-Objekt zurückgeben
         return ""
+    # Falls alles schiefgeht:
+    return ""
 
-    kwargs: dict[str, Any] = {}
 
-    if index.unique:
-        kwargs["unique"] = True
-
-    if "postgresql" in index.dialect_options:
-        dialect_opts = index.dialect_options["postgresql"]
-        if "using" in dialect_opts:
-            using = dialect_opts["using"]
-            kwargs["postgresql_using"] = (
-                f"'{using}'" if isinstance(using, str) else using
-            )
-
-        if opclass_map:
-            kwargs["postgresql_ops"] = opclass_map
-
-    return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
 
 
 TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
@@ -1238,6 +1297,12 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 all.append(model.name)
 
                 rendered.append(self.render_class(model))
+                # Am Ende des Generators (nach dem Rendern):
+                if RAW_SQL_INDEXES:
+                    print("# Folgende Indizes müssen manuell (per Migration/SQL) erstellt werden:")
+                    for sql in RAW_SQL_INDEXES:
+                        print(sql)
+
             elif table is not None:
                 rendered.append(f"{model.name} = {self.render_table(model.table)}")
 
