@@ -822,7 +822,6 @@ def clx_render_table(self: "TablesGenerator", table: Table) -> str:
                     continue
         args.append(self.render_constraint(constraint))
 
-
     for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
         if is_special_index(index):
             continue
