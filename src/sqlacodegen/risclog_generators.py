@@ -795,6 +795,18 @@ def clx_render_index(self: "TablesGenerator", index: Index) -> str:
 TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
 
 
+def is_special_index(index: Index) -> bool:
+    if "postgresql" in index.dialect_options:
+        using = index.dialect_options["postgresql"].get("using")
+        if using and using != "btree":
+            return True
+        if index.dialect_options["postgresql"].get("ops"):
+            return True
+    if getattr(index, "expressions", None):
+        return True
+    return False
+
+
 def clx_render_table(self: "TablesGenerator", table: Table) -> str:
     args: list[str] = [f"{table.name!r}, {self.base.metadata_ref}"]
     kwargs: dict[str, object] = {}
@@ -810,7 +822,10 @@ def clx_render_table(self: "TablesGenerator", table: Table) -> str:
                     continue
         args.append(self.render_constraint(constraint))
 
+
     for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
+        if is_special_index(index):
+            continue
         if len(index.columns) > 1 or not uses_default_name(index):
             idx_code = self.render_index(index)
             if idx_code.strip() and idx_code is not None:
@@ -1162,6 +1177,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             args.append(self.render_constraint(constraint))
 
         for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
+            if is_special_index(index):
+                continue
             if len(index.columns) > 1 or not uses_default_name(index):
                 idx_code = self.render_index(index)
                 if idx_code.strip() and idx_code is not None:
