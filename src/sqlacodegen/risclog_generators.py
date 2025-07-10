@@ -1,6 +1,6 @@
 import re
 from pprint import pformat
-from typing import TYPE_CHECKING, Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
 from sqlalchemy import (
     Column,
@@ -110,61 +110,23 @@ ALEMBIC_PUBLICATION_TEMPLATE = """{varname} = PGPublication(
     publish={publish!r},
 )
 """
-ALEMBIC_INDEX_TEMPLATE = """{varname} = PGIndex(
-    name={name!r},
-    table={table!r},
-    columns={columns!r},
-    using={using!r},
-    opclass={opclass!r},
-    unique={unique!r},
-)
-"""
-ALEMBIC_INDEX_STATEMENT = """
-SELECT
-    ix.indexrelid::regclass::text AS name,
-    t.relname AS tablename,
-    a.amname AS using,
-    ix.indisunique AS unique,
-    array_agg(pg_get_indexdef(ix.indexrelid, k + 1, TRUE)) AS columns,
-    array_agg(
-        CASE WHEN op.opcname IS NOT NULL THEN op.opcname ELSE NULL END
-    ) AS opclass
-FROM
-    pg_index ix
-    JOIN pg_class t ON t.oid = ix.indrelid
-    JOIN pg_class i ON i.oid = ix.indexrelid
-    JOIN pg_am a ON a.oid = i.relam
-    LEFT JOIN LATERAL (
-        SELECT unnest(ix.indkey) AS attnum, generate_subscripts(ix.indkey, 1) - 1 AS k
-    ) x ON TRUE
-    LEFT JOIN pg_attribute c ON c.attrelid = t.oid AND c.attnum = x.attnum
-    LEFT JOIN pg_opclass op ON op.oid = ANY(ix.indclass)
-WHERE
-    NOT ix.indisprimary
-    AND t.relkind = 'r'
-    AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
-GROUP BY ix.indexrelid, t.relname, a.amname, ix.indisunique
-ORDER BY name;
-"""
-
 ALEMBIC_PUBLICATION_STATEMENT = """
 SELECT
-    pub.pubname AS name,
-    array_agg(nsp.nspname || '.' || tbl.relname) AS tables,
-    pub.pubinsert AS publish_insert,
-    pub.pubupdate AS publish_update,
-    pub.pubdelete AS publish_delete,
-    pub.pubtruncate AS publish_truncate
+    p.pubname,
+    array_remove(array_agg(pt.relname), NULL) as tables,
+    (
+      CASE WHEN p.pubinsert THEN 'insert' ELSE '' END ||
+      CASE WHEN p.pubupdate THEN ', update' ELSE '' END ||
+      CASE WHEN p.pubdelete THEN ', delete' ELSE '' END ||
+      CASE WHEN p.pubtruncate THEN ', truncate' ELSE ''
+    END
+    ) as publish
 FROM
-    pg_publication pub
-    JOIN pg_publication_rel pr ON pub.oid = pr.prpubid
-    JOIN pg_class tbl ON pr.prrelid = tbl.oid
-    JOIN pg_namespace nsp ON tbl.relnamespace = nsp.oid
-GROUP BY
-    pub.pubname, pub.pubinsert, pub.pubupdate, pub.pubdelete, pub.pubtruncate
-ORDER BY pub.pubname;
+    pg_publication p
+    LEFT JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+    LEFT JOIN pg_class pt ON pt.oid = pr.prrelid
+GROUP BY p.pubname, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate
 """
-
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
 FROM
@@ -185,7 +147,6 @@ ORDER BY
     n.nspname,
     p.proname;
 """
-
 
 ALEMBIC_POLICIES_STATEMENT = """SELECT
     pol.polname AS policy_name,
@@ -306,6 +267,108 @@ ORDER BY s.sequence_schema, s.sequence_name;
 """
 
 
+ALEMBIC_INDEX_STATEMENT = """
+SELECT
+    c.relname AS index_name,
+    t.relname AS table_name,
+    n.nspname AS schema_name,
+    pg_get_indexdef(c.oid) AS definition
+FROM
+    pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_index i ON i.indexrelid = c.oid
+    JOIN pg_class t ON t.oid = i.indrelid
+WHERE
+    c.relkind = 'i'
+    AND n.nspname = :schema
+ORDER BY
+    index_name;
+"""
+ALEMBIC_INDEX_TEMPLATE = """{varname} = PGIndex(
+    schema={schema!r},
+    signature={signature!r},
+    definition=\"\"\"{definition}\"\"\",
+    table={table!r},
+    index_name={index_name!r},
+)
+"""
+SPECIAL_INDEX_PATTERNS = [
+    # 1. Nicht-btree USING-Klausel
+    r"\bUSING\s+(?!btree\b)[a-zA-Z_]+",
+    # 2. Funktions- oder Expressions-Index (z.B. upper(...), lower(...), coalesce(...), etc.)
+    r"\((?:\s*[a-zA-Z_]+\s*\([^)]+\))",
+    # 3. Operator Class (z.B. gin_trgm_ops)
+    r"(\bgin_trgm_ops\b|\bgist_trgm_ops\b|\bhash_ops\b|\bjsonb_path_ops\b|\btext_pattern_ops\b)",
+    # 4. OPCLASS oder OPS explizit (SQLAlchemy kennt keine dialektübergreifende Syntax dafür)
+    r"ops\s*=",
+    r"opclass\s*=",
+    # 5. WITH (...) Storage-Parameter (Postgres)
+    r"\bWITH\s*\([^)]+\)",
+    # 6. WHERE-Klausel (Partial Index)
+    r"\bWHERE\b",
+    # 7. ASC/DESC/NULLS FIRST/LAST an einzelnen Indexspalten (selten in ORM gepflegt)
+    r"\bASC\b|\bDESC\b|\bNULLS\s+(FIRST|LAST)\b",
+]
+
+
+def is_special_index_definition(
+    definition: str, extra_patterns: Optional[list[str]] = None
+) -> bool:
+    patterns = SPECIAL_INDEX_PATTERNS + (extra_patterns or [])
+    for pat in patterns:
+        if re.search(pat, definition, re.IGNORECASE):
+            return True
+    return False
+
+
+def parse_index_row(
+    row: dict[str, str], template_def: str, schema: str | None
+) -> tuple[str, str] | None:
+    definition = row["definition"]
+    if not is_special_index_definition(definition):
+        return None  # Nur spezielle Indizes ausgeben!
+
+    index_name = row["index_name"]
+    table_name = row["table_name"]
+    schema_name = row.get("schema_name", schema) or "public"
+
+    varname = f"{index_name}_{table_name}".lower()
+    signature = f"{index_name} ON {table_name}"
+
+    code = template_def.format(
+        varname=varname,
+        schema=schema_name,
+        signature=signature,
+        definition=definition,
+        table=table_name,
+        index_name=index_name,
+    )
+    return code, varname
+
+
+def parse_publication_row(
+    row: dict[str, Any],
+    template_def: str,
+    schema: str | None,
+) -> tuple[str, str] | None:
+    name = row.get("pubname")
+    tables = row.get("tables") or []
+    if isinstance(tables, str):
+        tables = [t.strip() for t in tables.split(",") if t.strip()]
+    publish = row.get("publish") or ""
+    owner = row.get("owner") or None
+
+    varname = f"{name}".lower()
+    code = template_def.format(
+        varname=varname,
+        name=name,
+        tables=tables,
+        publish=publish,
+        owner=owner,
+    )
+    return code, varname
+
+
 def finalize_alembic_utils(
     pg_alembic_definition: list[str],
     entities: list[str],
@@ -319,8 +382,8 @@ def finalize_alembic_utils(
         "all_sequences": "from alembic_utils.pg_sequence import PGSequence",
         "all_extensions": "from alembic_utils.pg_extension import PGExtension",
         "all_aggregates": "from alembic_utils.pg_aggregate import PGAggregate",
-        "all_publications": "from alembic_utils.pg_publication import PGPublication",
-        "all_indexes": "from alembic_utils.pg_index import PGIndex",
+        "all_publications": "from risclog.claimxdb.alembic.object_ops import PGPublication",
+        "all_indices": "from risclog.claimxdb.alembic.object_ops import PGIndex",
     }
     import_stmt = imports.get(
         entities_name or "all_views",
@@ -331,56 +394,6 @@ def finalize_alembic_utils(
     pg_alembic_definition.insert(0, f"{import_stmt}  # noqa: I001\n\n")
 
     return pg_alembic_definition
-
-
-def parse_index_row(
-    row: dict[str, Any], template_def: str, schema: str | None = None
-) -> tuple[str, str | Any]:
-    name = row["name"]
-    table = row["tablename"]
-    columns = row["columns"]
-    using = row["using"] if row.get("using") else None
-    unique = bool(row.get("unique", False))
-    opclass_list = [opc for opc in row.get("opclass", []) if opc]
-    opclass = opclass_list[0] if opclass_list else None
-
-    varname = name.lower()
-    code = template_def.format(
-        varname=varname,
-        name=name,
-        table=table,
-        columns=columns,
-        using=using,
-        opclass=opclass,
-        unique=unique,
-    )
-    return code, varname
-
-
-def parse_publication_row(
-    row: dict[str, Any], template_def: str, schema: str | None = None
-) -> tuple[str, str | Any]:
-    name = row["name"]
-    tables = row["tables"]
-    pub_ops = []
-    if row.get("publish_insert"):
-        pub_ops.append("insert")
-    if row.get("publish_update"):
-        pub_ops.append("update")
-    if row.get("publish_delete"):
-        pub_ops.append("delete")
-    if row.get("publish_truncate"):
-        pub_ops.append("truncate")
-    publish = ", ".join(pub_ops) or "insert, update, delete"
-
-    varname = name.lower()
-    code = template_def.format(
-        varname=varname,
-        name=name,
-        tables=tables,
-        publish=publish,
-    )
-    return code, varname
 
 
 def parse_function_row(
@@ -509,7 +522,6 @@ def parse_aggregate_row(
     initcond = row.get("initcond")
     schema_val = schema or row.get("schema") or "public"
 
-    # Baue die Definition als lesbare String-Config:
     definition_parts = []
     if sfunc:
         definition_parts.append(f"SFUNC = {sfunc}")
@@ -759,52 +771,78 @@ def clx_generate_base(self: "TablesGenerator") -> None:
 TablesGenerator.generate_base = clx_generate_base  # type: ignore[method-assign]
 
 
+def is_special_index(index: Index) -> bool:
+    from sqlalchemy.sql.elements import TextClause
+
+    if any(isinstance(expr, TextClause) for expr in getattr(index, "expressions", [])):
+        return True
+    opts = getattr(index, "dialect_options", {}).get("postgresql", {})
+    if opts.get("using") or opts.get("ops"):
+        return True
+    return False
+
+
 def clx_render_index(self: "TablesGenerator", index: Index) -> str:
-    if index.columns and all(hasattr(col, "name") for col in index.columns):
-        opclass_map = {}
-        elements = [repr(col.name) for col in index.columns]
-        if (
-            "postgresql" in index.dialect_options
-            and index.dialect_options["postgresql"].get("using") == "gin"
-        ):
-            for col in index.columns:
+    elements = []
+    opclass_map = {}
+
+    if index.columns:
+        for col in index.columns:
+            elements.append(repr(col.name))
+
+            if (
+                "postgresql" in index.dialect_options
+                and index.dialect_options["postgresql"].get("using") == "gin"
+                and hasattr(col, "type")
+            ):
                 coltype = getattr(col.type, "python_type", None)
                 if isinstance(
                     col.type, (satypes.String, satypes.Text, satypes.Unicode)
                 ) or (coltype and coltype is str):
                     opclass_map[col.name] = "gin_trgm_ops"
 
-        kwargs: dict[str, object] = {}
-        if index.unique:
-            kwargs["unique"] = True
-        if "postgresql" in index.dialect_options:
-            using = index.dialect_options["postgresql"].get("using")
-            if using:
-                kwargs["postgresql_using"] = using
-            if opclass_map:
-                kwargs["postgresql_ops"] = opclass_map
+    elif getattr(index, "expressions", None):
+        for expr in index.expressions:
+            expr_str = str(expr).strip()
+            elements.append(f"text({expr_str!r})")
 
-        return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
+            if (
+                "postgresql" in index.dialect_options
+                and index.dialect_options["postgresql"].get("using") == "gin"
+            ):
+                if (
+                    "::tsvector" not in expr_str
+                    and "array" not in expr_str.lower()
+                    and "json" not in expr_str.lower()
+                ):
+                    opclass_map[expr_str] = "gin_trgm_ops"
 
-    expressions = getattr(index, "expressions", None)
-    if expressions:
+    if not elements:
+        print(
+            f"# WARNING: Skipped index {getattr(index, 'name', None)!r} on table {getattr(index.table, 'name', None)!r} (no columns or expressions)."
+        )
         return ""
-    return ""
+
+    kwargs: dict[str, Any] = {}
+
+    if index.unique:
+        kwargs["unique"] = True
+
+    if "postgresql" in index.dialect_options:
+        dialect_opts = index.dialect_options["postgresql"]
+        if "using" in dialect_opts:
+            using = dialect_opts["using"]
+            kwargs["postgresql_using"] = (
+                f"'{using}'" if isinstance(using, str) else using
+            )
+
+        if opclass_map:
+            kwargs["postgresql_ops"] = opclass_map
+
+    return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
 
 
 TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
-
-
-def is_special_index(index: Index) -> bool:
-    if "postgresql" in index.dialect_options:
-        using = index.dialect_options["postgresql"].get("using")
-        if using and using != "btree":
-            return True
-        if index.dialect_options["postgresql"].get("ops"):
-            return True
-    if getattr(index, "expressions", None):
-        return True
-    return False
 
 
 def clx_render_table(self: "TablesGenerator", table: Table) -> str:
@@ -822,9 +860,9 @@ def clx_render_table(self: "TablesGenerator", table: Table) -> str:
                     continue
         args.append(self.render_constraint(constraint))
 
-    for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
-        if is_special_index(index):
-            continue
+    normal_indices = [idx for idx in table.indexes if not is_special_index(idx)]
+    for index in sorted(normal_indices, key=lambda i: str(i.name or "")):
+        # for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
         if len(index.columns) > 1 or not uses_default_name(index):
             idx_code = self.render_index(index)
             if idx_code.strip() and idx_code is not None:
@@ -1015,7 +1053,6 @@ def get_table_managed_sequences(metadata: MetaData) -> set[str]:
         for column in table.columns:
             default = getattr(column, "default", None)
             if default is not None:
-                # Sequence kann als Default o. direkt als ServerDefault hinterlegt sein
                 if hasattr(default, "name"):
                     seq_names.add(default.name)
             if hasattr(column, "sequence") and column.sequence is not None:
@@ -1039,10 +1076,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
 
         sql = globals()[statement]
         template_def = globals()[template]
-
-        # Hole alle aus DB
         result: list[dict[str, Any]] = fetch_all_mappings(conn, sql, {"schema": schema})
-        # Finde alle, die von Tables verwaltet werden
+
         entities = [
             parsed
             for row in result
@@ -1174,10 +1209,9 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 ):
                     continue
             args.append(self.render_constraint(constraint))
-
-        for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
-            if is_special_index(index):
-                continue
+        normal_indices = [idx for idx in table.indexes if not is_special_index(idx)]
+        for index in sorted(normal_indices, key=lambda i: str(i.name or "")):
+            # for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
             if len(index.columns) > 1 or not uses_default_name(index):
                 idx_code = self.render_index(index)
                 if idx_code.strip() and idx_code is not None:
@@ -1243,7 +1277,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             "ARRAY": ("sqlalchemy", "ARRAY"),
         }
 
-        # Ergänzung: Ermittlung aller Extension-Objekte (Tabellen, Views, etc.)
         def get_extension_object_names(
             conn: Connection, schemas: set[str | None]
         ) -> Any:
@@ -1269,7 +1302,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 extension_objs |= {row[0] for row in result}
             return extension_objs
 
-        # Hole nur einmal die Extension-Objekte aus der DB
         conn = self.bind.connect() if hasattr(self.bind, "connect") else self.bind
         EXTENSION_OBJECTS = get_extension_object_names(conn, schemas)
 
@@ -1314,13 +1346,12 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             schema = table.schema
             schema_views = views_by_schema.get(schema, set())
 
-            # **Hier: Filter für System- und Extension-Objekte**
             if table.schema and table.schema.startswith("pg_"):
-                continue  # Skip Postgres System-Views
+                continue
             if table.name.startswith("pg_"):
-                continue  # Skip system views
+                continue
             if table.name in EXTENSION_OBJECTS:
-                continue  # Skip Extension-Objekte
+                continue
 
             for col in table.columns:
                 sa_type = sa_type_from_column(col)
@@ -1346,7 +1377,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 all.append(model.name)
 
                 rendered.append(self.render_class(model))
-
             elif table is not None:
                 rendered.append(f"{model.name} = {self.render_table(model.table)}")
 
