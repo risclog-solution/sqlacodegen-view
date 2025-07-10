@@ -30,7 +30,9 @@ from sqlacodegen.risclog_generators import (
     parse_aggregate_row,
     parse_extension_row,
     parse_function_row,
+    parse_index_row,
     parse_policy_row,
+    parse_publication_row,
     parse_trigger_row,
 )
 from sqlacodegen.seed_export import export_pgdata_py, get_table_dependency_order
@@ -244,6 +246,22 @@ def main() -> None:
             "statement": "ALEMBIC_EXTENSION_STATEMENT",
             "parse_row_func": parse_extension_row,
             "file": "pg_extensions.py",
+        },
+        {
+            "title": "Publications",
+            "entities_varname": "all_publications",
+            "template": "ALEMBIC_PUBLICATION_TEMPLATE",
+            "statement": "ALEMBIC_PUBLICATION_STATEMENT",
+            "parse_row_func": parse_publication_row,
+            "file": "pg_publications.py",
+        },
+        {
+            "title": "Indexes",
+            "entities_varname": "all_indexes",
+            "template": "ALEMBIC_INDEX_TEMPLATE",
+            "statement": "ALEMBIC_INDEX_STATEMENT",
+            "parse_row_func": parse_index_row,
+            "file": "pg_indexes.py",
         },
     ]
 

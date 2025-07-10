@@ -104,6 +104,66 @@ ALEMBIC_SEQUENCE_TEMPLATE = """{varname} = PGSequence(
     definition=\"\"\"{definition}\"\"\",
 )
 """
+ALEMBIC_PUBLICATION_TEMPLATE = """{varname} = PGPublication(
+    name={name!r},
+    tables={tables!r},
+    publish={publish!r},
+)
+"""
+ALEMBIC_INDEX_TEMPLATE = """{varname} = PGIndex(
+    name={name!r},
+    table={table!r},
+    columns={columns!r},
+    using={using!r},
+    opclass={opclass!r},
+    unique={unique!r},
+)
+"""
+ALEMBIC_INDEX_STATEMENT = """
+SELECT
+    ix.indexrelid::regclass::text AS name,
+    t.relname AS tablename,
+    a.amname AS using,
+    ix.indisunique AS unique,
+    array_agg(pg_get_indexdef(ix.indexrelid, k + 1, TRUE)) AS columns,
+    array_agg(
+        CASE WHEN op.opcname IS NOT NULL THEN op.opcname ELSE NULL END
+    ) AS opclass
+FROM
+    pg_index ix
+    JOIN pg_class t ON t.oid = ix.indrelid
+    JOIN pg_class i ON i.oid = ix.indexrelid
+    JOIN pg_am a ON a.oid = i.relam
+    LEFT JOIN LATERAL (
+        SELECT unnest(ix.indkey) AS attnum, generate_subscripts(ix.indkey, 1) - 1 AS k
+    ) x ON TRUE
+    LEFT JOIN pg_attribute c ON c.attrelid = t.oid AND c.attnum = x.attnum
+    LEFT JOIN pg_opclass op ON op.oid = ANY(ix.indclass)
+WHERE
+    NOT ix.indisprimary
+    AND t.relkind = 'r'
+    AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+GROUP BY ix.indexrelid, t.relname, a.amname, ix.indisunique
+ORDER BY name;
+"""
+
+ALEMBIC_PUBLICATION_STATEMENT = """
+SELECT
+    pub.pubname AS name,
+    array_agg(nsp.nspname || '.' || tbl.relname) AS tables,
+    pub.pubinsert AS publish_insert,
+    pub.pubupdate AS publish_update,
+    pub.pubdelete AS publish_delete,
+    pub.pubtruncate AS publish_truncate
+FROM
+    pg_publication pub
+    JOIN pg_publication_rel pr ON pub.oid = pr.prpubid
+    JOIN pg_class tbl ON pr.prrelid = tbl.oid
+    JOIN pg_namespace nsp ON tbl.relnamespace = nsp.oid
+GROUP BY
+    pub.pubname, pub.pubinsert, pub.pubupdate, pub.pubdelete, pub.pubtruncate
+ORDER BY pub.pubname;
+"""
 
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
@@ -259,6 +319,8 @@ def finalize_alembic_utils(
         "all_sequences": "from alembic_utils.pg_sequence import PGSequence",
         "all_extensions": "from alembic_utils.pg_extension import PGExtension",
         "all_aggregates": "from alembic_utils.pg_aggregate import PGAggregate",
+        "all_publications": "from alembic_utils.pg_publication import PGPublication",
+        "all_indexes": "from alembic_utils.pg_index import PGIndex",
     }
     import_stmt = imports.get(
         entities_name or "all_views",
@@ -269,6 +331,56 @@ def finalize_alembic_utils(
     pg_alembic_definition.insert(0, f"{import_stmt}  # noqa: I001\n\n")
 
     return pg_alembic_definition
+
+
+def parse_index_row(
+    row: dict[str, Any], template_def: str, schema: str | None = None
+) -> tuple[str, str | Any]:
+    name = row["name"]
+    table = row["tablename"]
+    columns = row["columns"]
+    using = row["using"] if row.get("using") else None
+    unique = bool(row.get("unique", False))
+    opclass_list = [opc for opc in row.get("opclass", []) if opc]
+    opclass = opclass_list[0] if opclass_list else None
+
+    varname = name.lower()
+    code = template_def.format(
+        varname=varname,
+        name=name,
+        table=table,
+        columns=columns,
+        using=using,
+        opclass=opclass,
+        unique=unique,
+    )
+    return code, varname
+
+
+def parse_publication_row(
+    row: dict[str, Any], template_def: str, schema: str | None = None
+) -> tuple[str, str | Any]:
+    name = row["name"]
+    tables = row["tables"]
+    pub_ops = []
+    if row.get("publish_insert"):
+        pub_ops.append("insert")
+    if row.get("publish_update"):
+        pub_ops.append("update")
+    if row.get("publish_delete"):
+        pub_ops.append("delete")
+    if row.get("publish_truncate"):
+        pub_ops.append("truncate")
+    publish = ", ".join(pub_ops) or "insert, update, delete"
+
+    varname = name.lower()
+    code = template_def.format(
+        varname=varname,
+        name=name,
+        tables=tables,
+        publish=publish,
+    )
+    return code, varname
 
 
 def parse_function_row(
@@ -297,12 +409,15 @@ def parse_function_row(
     schema = schema or "public"
 
     name = name.lower()
-    return template_def.format(
-        varname=name,
-        schema=schema,
-        signature=signature,
-        definition=unescape_sql_string(squash_whitespace(definition)),
-    ), name
+    return (
+        template_def.format(
+            varname=name,
+            schema=schema,
+            signature=signature,
+            definition=unescape_sql_string(squash_whitespace(definition)),
+        ),
+        name,
+    )
 
 
 def parse_policy_row(
@@ -449,9 +564,11 @@ def parse_sequence_row(
         f"MINVALUE {row['minimum_value']}",
         f"MAXVALUE {row['maximum_value']}",
         f"CACHE {row['cache_size']}",
-        "CYCLE"
-        if str(row.get("cycle", "")).lower() in ("yes", "true", "on", "1")
-        else "NO CYCLE",
+        (
+            "CYCLE"
+            if str(row.get("cycle", "")).lower() in ("yes", "true", "on", "1")
+            else "NO CYCLE"
+        ),
     ]
     definition = "\n    ".join(parts)
 
@@ -642,123 +759,37 @@ def clx_generate_base(self: "TablesGenerator") -> None:
 TablesGenerator.generate_base = clx_generate_base  # type: ignore[method-assign]
 
 
-# def clx_render_index(self: "TablesGenerator", index: Index) -> str:
-#     elements = []
-#     opclass_map = {}
-
-#     if index.columns:
-#         for col in index.columns:
-#             elements.append(repr(col.name))
-
-#             if (
-#                 "postgresql" in index.dialect_options
-#                 and index.dialect_options["postgresql"].get("using") == "gin"
-#                 and hasattr(col, "type")
-#             ):
-#                 coltype = getattr(col.type, "python_type", None)
-#                 if isinstance(
-#                     col.type, (satypes.String, satypes.Text, satypes.Unicode)
-#                 ) or (coltype and coltype is str):
-#                     opclass_map[col.name] = "gin_trgm_ops"
-
-#     elif getattr(index, "expressions", None):
-#         for expr in index.expressions:
-#             expr_str = str(expr).strip()
-#             elements.append(f"text({expr_str!r})")
-
-#             if (
-#                 "postgresql" in index.dialect_options
-#                 and index.dialect_options["postgresql"].get("using") == "gin"
-#             ):
-#                 if (
-#                     "::tsvector" not in expr_str
-#                     and "array" not in expr_str.lower()
-#                     and "json" not in expr_str.lower()
-#                 ):
-#                     opclass_map[expr_str] = "gin_trgm_ops"
-
-#     if not elements:
-#         print(
-#             f"# WARNING: Skipped index {getattr(index, 'name', None)!r} on table {getattr(index.table, 'name', None)!r} (no columns or expressions)."
-#         )
-#         return ""
-
-#     kwargs: dict[str, Any] = {}
-
-#     if index.unique:
-#         kwargs["unique"] = True
-
-#     if "postgresql" in index.dialect_options:
-#         dialect_opts = index.dialect_options["postgresql"]
-#         if "using" in dialect_opts:
-#             using = dialect_opts["using"]
-#             kwargs["postgresql_using"] = (
-#                 f"'{using}'" if isinstance(using, str) else using
-#             )
-
-#         if opclass_map:
-#             kwargs["postgresql_ops"] = opclass_map
-
-#     return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
-
-RAW_SQL_INDEXES = []
-
 def clx_render_index(self: "TablesGenerator", index: Index) -> str:
-    """
-    Render SQLAlchemy Index for ORM if possible, otherwise collect as RAW SQL.
-    """
-    # Normale Spaltenindizes
     if index.columns and all(hasattr(col, "name") for col in index.columns):
         opclass_map = {}
         elements = [repr(col.name) for col in index.columns]
-        # GIN + Operator für Textspalten
         if (
             "postgresql" in index.dialect_options
             and index.dialect_options["postgresql"].get("using") == "gin"
         ):
             for col in index.columns:
                 coltype = getattr(col.type, "python_type", None)
-                if (
-                    isinstance(col.type, (satypes.String, satypes.Text, satypes.Unicode))
-                    or (coltype and coltype is str)
-                ):
+                if isinstance(
+                    col.type, (satypes.String, satypes.Text, satypes.Unicode)
+                ) or (coltype and coltype is str):
                     opclass_map[col.name] = "gin_trgm_ops"
 
-        kwargs = {}
+        kwargs: dict[str, object] = {}
         if index.unique:
             kwargs["unique"] = True
         if "postgresql" in index.dialect_options:
             using = index.dialect_options["postgresql"].get("using")
             if using:
-                kwargs["postgresql_using"] = f"'{using}'"
+                kwargs["postgresql_using"] = using
             if opclass_map:
                 kwargs["postgresql_ops"] = opclass_map
 
         return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
 
-    # Ausdrücke im Index? (text/func etc.)
     expressions = getattr(index, "expressions", None)
     if expressions:
-        is_gin = (
-            "postgresql" in index.dialect_options
-            and index.dialect_options["postgresql"].get("using") == "gin"
-        )
-        for expr in expressions:
-            expr_str = str(expr).strip()
-            table_name = getattr(index.table, "name", "<unknown_table>")
-            if is_gin:
-                # GIN-Index auf Ausdruck – RAW SQL
-                sql = f"CREATE INDEX {index.name} ON {table_name} USING gin ({expr_str} gin_trgm_ops);"
-            else:
-                # Sonstige Index-Typen auf Ausdruck
-                sql = f"CREATE INDEX {index.name} ON {table_name} ({expr_str});"
-            RAW_SQL_INDEXES.append(sql)
-        # Niemals als Python-Index-Objekt zurückgeben
         return ""
-    # Falls alles schiefgeht:
     return ""
-
-
 
 
 TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
@@ -1203,7 +1234,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             extension_objs = set()
             for schema in schemas:
                 result = conn.execute(
-                    text("""
+                    text(
+                        """
                     SELECT c.relname
                     FROM pg_class c
                     JOIN pg_namespace n ON c.relnamespace = n.oid
@@ -1214,7 +1246,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                         JOIN pg_extension e ON d.refobjid = e.oid
                         WHERE d.objid = c.oid AND d.deptype = 'e'
                     )
-                """),
+                """
+                    ),
                     {"schema": schema},
                 )
                 extension_objs |= {row[0] for row in result}
@@ -1297,11 +1330,6 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 all.append(model.name)
 
                 rendered.append(self.render_class(model))
-                # Am Ende des Generators (nach dem Rendern):
-                if RAW_SQL_INDEXES:
-                    print("# Folgende Indizes müssen manuell (per Migration/SQL) erstellt werden:")
-                    for sql in RAW_SQL_INDEXES:
-                        print(sql)
 
             elif table is not None:
                 rendered.append(f"{model.name} = {self.render_table(model.table)}")
@@ -1315,6 +1343,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         self.add_literal_import("sqlalchemy", "text")
         self.add_literal_import("sqlalchemy", "FetchedValue")
 
-        return "\n\n".join(rendered), finalize_alembic_utils(
-            pg_alembic_definition, entities, entities_name
-        ) if pg_alembic_definition else None
+        return "\n\n".join(rendered), (
+            finalize_alembic_utils(pg_alembic_definition, entities, entities_name)
+            if pg_alembic_definition
+            else None
+        )
