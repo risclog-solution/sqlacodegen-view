@@ -68,37 +68,55 @@ def get_table_dependency_order(metadata: MetaData) -> list[str]:
 
     graph: dict[str, set[str]] = defaultdict(set)
     for table in metadata.tables.values():
+        graph[table.name]
+
+    for table in metadata.tables.values():
         name = table.name
         for fk in table.foreign_keys:
             parent = fk.column.table.name
             if parent != name:
                 graph[name].add(parent)
 
-    visited: set[str] = set()
-    result: list[str] = []
+    try:
+        from graphlib import TopologicalSorter
 
-    def visit(node: str) -> None:
-        if node in visited:
-            return
-        visited.add(node)
-        for dep in graph[node]:
-            visit(dep)
-        result.append(node)
+        ts = TopologicalSorter(graph)
+        order = list(ts.static_order())
+    except ImportError:
+        visited: set[str] = set()
+        result: list[str] = []
 
-    for table in metadata.tables.values():
-        visit(table.name)
-    return result[::-1]
+        def visit(node: str) -> None:
+            if node in visited:
+                return
+            visited.add(node)
+            for dep in graph[node]:
+                visit(dep)
+            result.append(node)
+
+        for node in graph:
+            visit(node)
+        order = result[::-1]
+
+    return order
 
 
 def export_pgdata_py(
-    engine: Engine, metadata: MetaData, out_path: Path, max_rows: int | None = None
+    engine: Engine,
+    metadata: MetaData,
+    out_path: Path,
+    max_rows: int | None = None,
+    view_table_names: set[str] | None = None,
 ) -> None:
+    view_table_names = view_table_names or set()
     order = get_table_dependency_order(metadata)
     data: dict[str, list[dict[str, Any]]] = {}
 
     with engine.connect() as conn:
         for name in order:
             if name not in metadata.tables:
+                continue
+            if name in view_table_names:
                 continue
             table = metadata.tables[name]
             stmt = select(table)
