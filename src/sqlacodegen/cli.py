@@ -344,11 +344,16 @@ def main() -> None:
 
     # ----------- PGData SEED Export separat ------------
     if args.outfile_dir:
+        all_view_names = set()
+        for schema in schemas:
+            all_view_names |= set(inspector.get_view_names(schema=schema))
+
         dest_pg_path = Path(str(parent), "pg_seeds.py")
         export_pgdata_py(
             engine=engine,
             metadata=metadata_tables,
             out_path=dest_pg_path,
+            view_table_names=all_view_names,
         )
         print(f"PGData Seed geschrieben nach: {dest_pg_path.as_posix()}")
 
@@ -389,5 +394,6 @@ def main() -> None:
             models_by_table=models_by_table,
             factories_path=Path(parent) / "factories.py",
             dependency_order=dependency_order,
+            view_table_names=all_view_names,
         )
         print(f"Factories & Fixtures geschrieben nach: {parent.as_posix()}")

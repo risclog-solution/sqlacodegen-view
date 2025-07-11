@@ -102,14 +102,21 @@ def get_table_dependency_order(metadata: MetaData) -> list[str]:
 
 
 def export_pgdata_py(
-    engine: Engine, metadata: MetaData, out_path: Path, max_rows: int | None = None
+    engine: Engine,
+    metadata: MetaData,
+    out_path: Path,
+    max_rows: int | None = None,
+    view_table_names: set[str] | None = None,
 ) -> None:
+    view_table_names = view_table_names or set()
     order = get_table_dependency_order(metadata)
     data: dict[str, list[dict[str, Any]]] = {}
 
     with engine.connect() as conn:
         for name in order:
             if name not in metadata.tables:
+                continue
+            if name in view_table_names:
                 continue
             table = metadata.tables[name]
             stmt = select(table)

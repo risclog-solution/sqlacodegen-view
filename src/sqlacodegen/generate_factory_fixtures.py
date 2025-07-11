@@ -49,10 +49,13 @@ def export_factory_fixtures(
     models_by_table: dict[str, type[Any]],
     factories_path: Path,
     dependency_order: Sequence[str],
+    view_table_names: set[str],
 ) -> None:
     # *** Filter dependency_order anhand von EXCLUDED_TABLES ***
     filtered_order = [
-        table for table in dependency_order if table not in EXCLUDED_TABLES
+        table
+        for table in dependency_order
+        if table not in EXCLUDED_TABLES and table not in view_table_names
     ]
 
     model_names = {models_by_table[table].__name__ for table in filtered_order}
