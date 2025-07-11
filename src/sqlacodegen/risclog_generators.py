@@ -1,6 +1,6 @@
 import re
 from pprint import pformat
-from typing import TYPE_CHECKING, Any, Callable, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from sqlalchemy import (
     Column,
@@ -267,99 +267,6 @@ ORDER BY s.sequence_schema, s.sequence_name;
 """
 
 
-ALEMBIC_INDEX_STATEMENT = """
-SELECT
-    c.relname AS index_name,
-    t.relname AS table_name,
-    n.nspname AS schema_name,
-    pg_get_indexdef(c.oid) AS definition,
-    (con.oid IS NOT NULL) AS is_constraint,
-    con.contype
-FROM
-    pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    JOIN pg_index i ON i.indexrelid = c.oid
-    JOIN pg_class t ON t.oid = i.indrelid
-    LEFT JOIN pg_constraint con ON con.conindid = c.oid
-WHERE
-    c.relkind = 'i'
-    AND n.nspname = :schema
-ORDER BY
-    index_name
-
-"""
-ALEMBIC_INDEX_TEMPLATE = """{varname} = PGIndex(
-    schema={schema!r},
-    signature={signature!r},
-    definition=\"\"\"{definition}\"\"\",
-    table={table!r},
-    index_name={index_name!r},
-    is_constraint={is_constraint!r},
-)
-"""
-
-SPECIAL_INDEX_PATTERNS = [
-    # 1. Nicht-btree USING-Klausel
-    r"\bUSING\s+(?!btree\b)[a-zA-Z_]+",
-    # 2. Funktions- oder Expressions-Index (z.B. upper(...), lower(...), coalesce(...), etc.)
-    r"\((?:\s*[a-zA-Z_]+\s*\([^)]+\))",
-    # 3. Operator Class (z.B. gin_trgm_ops)
-    r"(\bgin_trgm_ops\b|\bgist_trgm_ops\b|\bhash_ops\b|\bjsonb_path_ops\b|\btext_pattern_ops\b)",
-    # 4. OPCLASS oder OPS explizit (SQLAlchemy kennt keine dialektübergreifende Syntax dafür)
-    r"ops\s*=",
-    r"opclass\s*=",
-    # 5. WITH (...) Storage-Parameter (Postgres)
-    r"\bWITH\s*\([^)]+\)",
-    # 6. WHERE-Klausel (Partial Index)
-    r"\bWHERE\b",
-    # 7. ASC/DESC/NULLS FIRST/LAST an einzelnen Indexspalten (selten in ORM gepflegt)
-    r"\bASC\b|\bDESC\b|\bNULLS\s+(FIRST|LAST)\b",
-]
-
-
-def is_special_index_definition(
-    definition: str, extra_patterns: Optional[list[str]] = None
-) -> bool:
-    patterns = SPECIAL_INDEX_PATTERNS + (extra_patterns or [])
-    for pat in patterns:
-        if re.search(pat, definition, re.IGNORECASE):
-            return True
-    return False
-
-
-def parse_index_row(
-    row: dict[str, str], template_def: str, schema: str | None
-) -> tuple[str, str] | None:
-    contype = row.get("contype")
-    # NUR echte Indexe, KEINE PK/UNIQUE-Constraint-indizes
-    if contype in ("p", "u", "x"):  # x = exclude
-        print(f"SKIP CONSTRAINT INDEX: {row['index_name']} on {row['table_name']} (contype={contype})")
-        return None
-    
-    definition = row["definition"]
-    if not is_special_index_definition(definition):
-        return None  # Nur spezielle Indizes ausgeben!
-
-    index_name = row["index_name"]
-    table_name = row["table_name"]
-    schema_name = row.get("schema_name", schema) or "public"
-    is_constraint = row.get("is_constraint", False)
-    #print("######### DEBUG: Parsing index row #########",is_constraint)
-    varname = f"{index_name}_{table_name}".lower()
-    signature = f"{index_name} ON {table_name}"
-
-    code = template_def.format(
-        varname=varname,
-        schema=schema_name,
-        signature=signature,
-        definition=definition,
-        table=table_name,
-        index_name=index_name,
-        is_constraint=is_constraint,
-    )
-    return code, varname
-
-
 def parse_publication_row(
     row: dict[str, Any],
     template_def: str,
@@ -397,7 +304,6 @@ def finalize_alembic_utils(
         "all_extensions": "from alembic_utils.pg_extension import PGExtension",
         "all_aggregates": "from alembic_utils.pg_aggregate import PGAggregate",
         "all_publications": "from risclog.claimxdb.alembic.object_ops import PGPublication",
-        "all_indexes": "from risclog.claimxdb.alembic.object_ops import PGIndex",
     }
     import_stmt = imports.get(
         entities_name or "all_views",
@@ -785,59 +691,60 @@ def clx_generate_base(self: "TablesGenerator") -> None:
 TablesGenerator.generate_base = clx_generate_base  # type: ignore[method-assign]
 
 
-def is_special_index(index: Index) -> bool:
-    from sqlalchemy.sql.elements import TextClause
-
-    if any(isinstance(expr, TextClause) for expr in getattr(index, "expressions", [])):
-        return True
-    opts = getattr(index, "dialect_options", {}).get("postgresql", {})
-    if opts.get("using") or opts.get("ops"):
-        return True
-    return False
+def unqualify(colname: str) -> str:
+    if isinstance(colname, str):
+        return colname.split(".")[-1]
+    return str(colname)
 
 
 def clx_render_index(self: "TablesGenerator", index: Index) -> str:
-    elements = []
+    from sqlalchemy.sql.elements import TextClause
+
+    args = [repr(index.name)]
+    kwargs: dict[str, Any] = {}
     opclass_map = {}
 
-    if index.columns:
+    # --- Columns ---
+    if getattr(index, "columns", None) and len(index.columns) > 0:
         for col in index.columns:
-            elements.append(repr(col.name))
-
+            args.append(repr(unqualify(col.name)))
+            # Operator-Class GIN/TRGM
             if (
                 "postgresql" in index.dialect_options
                 and index.dialect_options["postgresql"].get("using") == "gin"
-                and hasattr(col, "type")
             ):
                 coltype = getattr(col.type, "python_type", None)
                 if isinstance(
                     col.type, (satypes.String, satypes.Text, satypes.Unicode)
                 ) or (coltype and coltype is str):
-                    opclass_map[col.name] = "gin_trgm_ops"
-
-    elif getattr(index, "expressions", None):
+                    opclass_map[unqualify(col.name)] = "gin_trgm_ops"
+    # --- Expressions/TextClause ---
+    elif getattr(index, "expressions", None) and len(index.expressions) > 0:
         for expr in index.expressions:
-            expr_str = str(expr).strip()
-            elements.append(f"text({expr_str!r})")
-
-            if (
-                "postgresql" in index.dialect_options
-                and index.dialect_options["postgresql"].get("using") == "gin"
-            ):
+            if isinstance(expr, TextClause):
+                expr_str = str(expr)
+                # GIN/TRGM als Suffix
                 if (
-                    "::tsvector" not in expr_str
-                    and "array" not in expr_str.lower()
-                    and "json" not in expr_str.lower()
+                    "postgresql" in index.dialect_options
+                    and index.dialect_options["postgresql"].get("using") == "gin"
+                    and not expr_str.rstrip().endswith("gin_trgm_ops")
                 ):
-                    opclass_map[expr_str] = "gin_trgm_ops"
-
-    if not elements:
-        print(
-            f"# WARNING: Skipped index {getattr(index, 'name', None)!r} on table {getattr(index.table, 'name', None)!r} (no columns or expressions)."
-        )
-        return ""
-
-    kwargs: dict[str, Any] = {}
+                    expr_str = f"{expr_str} gin_trgm_ops"
+                args.append(f"text({expr_str!r})")
+            else:
+                expr_str = str(expr)
+                m = re.match(r"^upper\(\((\w+)\)::text\)$", expr_str)
+                if (
+                    m
+                    and "postgresql" in index.dialect_options
+                    and index.dialect_options["postgresql"].get("using") == "gin"
+                ):
+                    args.append(f"text('upper(({m.group(1)})::text) gin_trgm_ops')")
+                else:
+                    args.append(f"text({expr_str!r})")
+    else:
+        # Fallback
+        pass
 
     if index.unique:
         kwargs["unique"] = True
@@ -849,11 +756,10 @@ def clx_render_index(self: "TablesGenerator", index: Index) -> str:
             kwargs["postgresql_using"] = (
                 f"'{using}'" if isinstance(using, str) else using
             )
-
         if opclass_map:
             kwargs["postgresql_ops"] = opclass_map
 
-    return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
+    return render_callable("Index", *args, kwargs=kwargs)
 
 
 TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
@@ -862,9 +768,12 @@ TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
 def clx_render_table(self: "TablesGenerator", table: Table) -> str:
     args: list[str] = [f"{table.name!r}, {self.base.metadata_ref}"]
     kwargs: dict[str, object] = {}
+
+    # Columns
     for column in table.columns:
         args.append(self.render_column(column, True, is_table=True))
 
+    # Constraints
     for constraint in sorted(table.constraints, key=get_constraint_sort_key):
         if uses_default_name(constraint):
             if isinstance(constraint, PrimaryKeyConstraint):
@@ -874,20 +783,25 @@ def clx_render_table(self: "TablesGenerator", table: Table) -> str:
                     continue
         args.append(self.render_constraint(constraint))
 
-    normal_indices = [idx for idx in table.indexes if not is_special_index(idx)]
-    for index in sorted(normal_indices, key=lambda i: str(i.name or "")):
-        # for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
-        if len(index.columns) > 1 or not uses_default_name(index):
-            idx_code = self.render_index(index)
-            if idx_code.strip() and idx_code is not None:
-                args.append(idx_code)
+    # Indices
+    for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
+        orig_columns = getattr(index, "columns", [])
+        if orig_columns:
+            table.indexes.remove(index)
+            columns = [table.c[unqualify(col.name)] for col in orig_columns]
+            new_index = Index(index.name, *columns, **index.kwargs)
+            table.append_constraint(new_index)
+        idx_code = self.render_index(index)
+        if idx_code.strip() and idx_code is not None:
+            args.append(idx_code)
 
     if table.schema:
-        kwargs["schema"] = repr(table.schema)
+        kwargs["schema"] = table.schema
 
+    # Table comment
     table_comment = getattr(table, "comment", None)
     if table_comment:
-        kwargs["comment"] = repr(table.comment)
+        kwargs["comment"] = table_comment
 
     return render_callable("Table", *args, kwargs=kwargs, indentation="    ")
 
@@ -1223,13 +1137,12 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                 ):
                     continue
             args.append(self.render_constraint(constraint))
-        normal_indices = [idx for idx in table.indexes if not is_special_index(idx)]
-        for index in sorted(normal_indices, key=lambda i: str(i.name or "")):
-            # for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
-            if len(index.columns) > 1 or not uses_default_name(index):
-                idx_code = self.render_index(index)
-                if idx_code.strip() and idx_code is not None:
-                    args.append(idx_code)
+
+        # NEU: ALLE Indexe (egal ob "special" oder nicht)
+        for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
+            idx_code = self.render_index(index)
+            if idx_code.strip() and idx_code is not None:
+                args.append(idx_code)
 
         if table.schema:
             kwargs["schema"] = table.schema
