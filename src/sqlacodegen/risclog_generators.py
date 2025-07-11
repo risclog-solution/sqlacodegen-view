@@ -272,17 +272,21 @@ SELECT
     c.relname AS index_name,
     t.relname AS table_name,
     n.nspname AS schema_name,
-    pg_get_indexdef(c.oid) AS definition
+    pg_get_indexdef(c.oid) AS definition,
+    (con.oid IS NOT NULL) AS is_constraint,
+    con.contype
 FROM
     pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_index i ON i.indexrelid = c.oid
     JOIN pg_class t ON t.oid = i.indrelid
+    LEFT JOIN pg_constraint con ON con.conindid = c.oid
 WHERE
     c.relkind = 'i'
     AND n.nspname = :schema
 ORDER BY
-    index_name;
+    index_name
+
 """
 ALEMBIC_INDEX_TEMPLATE = """{varname} = PGIndex(
     schema={schema!r},
@@ -290,8 +294,10 @@ ALEMBIC_INDEX_TEMPLATE = """{varname} = PGIndex(
     definition=\"\"\"{definition}\"\"\",
     table={table!r},
     index_name={index_name!r},
+    is_constraint={is_constraint!r},
 )
 """
+
 SPECIAL_INDEX_PATTERNS = [
     # 1. Nicht-btree USING-Klausel
     r"\bUSING\s+(?!btree\b)[a-zA-Z_]+",
@@ -324,6 +330,12 @@ def is_special_index_definition(
 def parse_index_row(
     row: dict[str, str], template_def: str, schema: str | None
 ) -> tuple[str, str] | None:
+    contype = row.get("contype")
+    # NUR echte Indexe, KEINE PK/UNIQUE-Constraint-indizes
+    if contype in ("p", "u", "x"):  # x = exclude
+        print(f"SKIP CONSTRAINT INDEX: {row['index_name']} on {row['table_name']} (contype={contype})")
+        return None
+    
     definition = row["definition"]
     if not is_special_index_definition(definition):
         return None  # Nur spezielle Indizes ausgeben!
@@ -331,7 +343,8 @@ def parse_index_row(
     index_name = row["index_name"]
     table_name = row["table_name"]
     schema_name = row.get("schema_name", schema) or "public"
-
+    is_constraint = row.get("is_constraint", False)
+    #print("######### DEBUG: Parsing index row #########",is_constraint)
     varname = f"{index_name}_{table_name}".lower()
     signature = f"{index_name} ON {table_name}"
 
@@ -342,6 +355,7 @@ def parse_index_row(
         definition=definition,
         table=table_name,
         index_name=index_name,
+        is_constraint=is_constraint,
     )
     return code, varname
 
@@ -383,7 +397,7 @@ def finalize_alembic_utils(
         "all_extensions": "from alembic_utils.pg_extension import PGExtension",
         "all_aggregates": "from alembic_utils.pg_aggregate import PGAggregate",
         "all_publications": "from risclog.claimxdb.alembic.object_ops import PGPublication",
-        "all_indices": "from risclog.claimxdb.alembic.object_ops import PGIndex",
+        "all_indexes": "from risclog.claimxdb.alembic.object_ops import PGIndex",
     }
     import_stmt = imports.get(
         entities_name or "all_views",
