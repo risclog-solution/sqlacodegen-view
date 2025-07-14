@@ -1081,6 +1081,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         has_id = False
 
         for col in table.columns:
+            sa_type = sa_type_from_column(col)
             if col.name == "id":
                 has_id = True
 

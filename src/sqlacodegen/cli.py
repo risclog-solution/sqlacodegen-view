@@ -25,7 +25,6 @@ try:
 except ImportError:
     pgvector = None
 
-from sqlacodegen.generate_factory_fixtures import export_factory_fixtures
 from sqlacodegen.risclog_generators import (
     parse_aggregate_row,
     parse_extension_row,
@@ -34,7 +33,7 @@ from sqlacodegen.risclog_generators import (
     parse_publication_row,
     parse_trigger_row,
 )
-from sqlacodegen.seed_export import export_pgdata_py, get_table_dependency_order
+from sqlacodegen.seed_export import export_pgdata_py
 
 if sys.version_info < (3, 10):
     from importlib_metadata import entry_points, version
@@ -380,20 +379,3 @@ def main() -> None:
                 model = type(class_name, (Base,), {"__table__": table})
                 models_by_table[table.name] = model
             return models_by_table
-
-        Base = getattr(generator, "base", None)
-        if Base is not None:
-            models = get_all_models(Base)
-            models_by_table = {m.__tablename__: m for m in models}
-        else:
-            models_by_table = make_dynamic_models(metadata_tables)
-
-        dependency_order = get_table_dependency_order(metadata_tables)
-
-        export_factory_fixtures(
-            models_by_table=models_by_table,
-            factories_path=Path(parent) / "factories.py",
-            dependency_order=dependency_order,
-            view_table_names=all_view_names,
-        )
-        print(f"Factories & Fixtures geschrieben nach: {parent.as_posix()}")
