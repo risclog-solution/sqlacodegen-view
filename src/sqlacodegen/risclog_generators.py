@@ -104,7 +104,29 @@ ALEMBIC_SEQUENCE_TEMPLATE = """{varname} = PGSequence(
     definition=\"\"\"{definition}\"\"\",
 )
 """
-
+ALEMBIC_PUBLICATION_TEMPLATE = """{varname} = PGPublication(
+    name={name!r},
+    tables={tables!r},
+    publish={publish!r},
+)
+"""
+ALEMBIC_PUBLICATION_STATEMENT = """
+SELECT
+    p.pubname,
+    array_remove(array_agg(pt.relname), NULL) as tables,
+    (
+      CASE WHEN p.pubinsert THEN 'insert' ELSE '' END ||
+      CASE WHEN p.pubupdate THEN ', update' ELSE '' END ||
+      CASE WHEN p.pubdelete THEN ', delete' ELSE '' END ||
+      CASE WHEN p.pubtruncate THEN ', truncate' ELSE ''
+    END
+    ) as publish
+FROM
+    pg_publication p
+    LEFT JOIN pg_publication_rel pr ON pr.prpubid = p.oid
+    LEFT JOIN pg_class pt ON pt.oid = pr.prrelid
+GROUP BY p.pubname, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate
+"""
 ALEMBIC_FUNCTION_STATEMENT = """SELECT
     pg_get_functiondef(p.oid) AS func
 FROM
@@ -125,7 +147,6 @@ ORDER BY
     n.nspname,
     p.proname;
 """
-
 
 ALEMBIC_POLICIES_STATEMENT = """SELECT
     pol.polname AS policy_name,
@@ -246,6 +267,29 @@ ORDER BY s.sequence_schema, s.sequence_name;
 """
 
 
+def parse_publication_row(
+    row: dict[str, Any],
+    template_def: str,
+    schema: str | None,
+) -> tuple[str, str] | None:
+    name = row.get("pubname")
+    tables = row.get("tables") or []
+    if isinstance(tables, str):
+        tables = [t.strip() for t in tables.split(",") if t.strip()]
+    publish = row.get("publish") or ""
+    owner = row.get("owner") or None
+
+    varname = f"{name}".lower()
+    code = template_def.format(
+        varname=varname,
+        name=name,
+        tables=tables,
+        publish=publish,
+        owner=owner,
+    )
+    return code, varname
+
+
 def finalize_alembic_utils(
     pg_alembic_definition: list[str],
     entities: list[str],
@@ -259,6 +303,7 @@ def finalize_alembic_utils(
         "all_sequences": "from alembic_utils.pg_sequence import PGSequence",
         "all_extensions": "from alembic_utils.pg_extension import PGExtension",
         "all_aggregates": "from alembic_utils.pg_aggregate import PGAggregate",
+        "all_publications": "from risclog.claimxdb.alembic.object_ops import PGPublication",
     }
     import_stmt = imports.get(
         entities_name or "all_views",
@@ -297,12 +342,15 @@ def parse_function_row(
     schema = schema or "public"
 
     name = name.lower()
-    return template_def.format(
-        varname=name,
-        schema=schema,
-        signature=signature,
-        definition=unescape_sql_string(squash_whitespace(definition)),
-    ), name
+    return (
+        template_def.format(
+            varname=name,
+            schema=schema,
+            signature=signature,
+            definition=unescape_sql_string(squash_whitespace(definition)),
+        ),
+        name,
+    )
 
 
 def parse_policy_row(
@@ -394,7 +442,6 @@ def parse_aggregate_row(
     initcond = row.get("initcond")
     schema_val = schema or row.get("schema") or "public"
 
-    # Baue die Definition als lesbare String-Config:
     definition_parts = []
     if sfunc:
         definition_parts.append(f"SFUNC = {sfunc}")
@@ -449,9 +496,11 @@ def parse_sequence_row(
         f"MINVALUE {row['minimum_value']}",
         f"MAXVALUE {row['maximum_value']}",
         f"CACHE {row['cache_size']}",
-        "CYCLE"
-        if str(row.get("cycle", "")).lower() in ("yes", "true", "on", "1")
-        else "NO CYCLE",
+        (
+            "CYCLE"
+            if str(row.get("cycle", "")).lower() in ("yes", "true", "on", "1")
+            else "NO CYCLE"
+        ),
     ]
     definition = "\n    ".join(parts)
 
@@ -642,48 +691,60 @@ def clx_generate_base(self: "TablesGenerator") -> None:
 TablesGenerator.generate_base = clx_generate_base  # type: ignore[method-assign]
 
 
+def unqualify(colname: str) -> str:
+    if isinstance(colname, str):
+        return colname.split(".")[-1]
+    return str(colname)
+
+
 def clx_render_index(self: "TablesGenerator", index: Index) -> str:
-    elements = []
+    from sqlalchemy.sql.elements import TextClause
+
+    args = [repr(index.name)]
+    kwargs: dict[str, Any] = {}
     opclass_map = {}
 
-    if index.columns:
+    # --- Columns ---
+    if getattr(index, "columns", None) and len(index.columns) > 0:
         for col in index.columns:
-            elements.append(repr(col.name))
-
+            args.append(repr(unqualify(col.name)))
+            # Operator-Class GIN/TRGM
             if (
                 "postgresql" in index.dialect_options
                 and index.dialect_options["postgresql"].get("using") == "gin"
-                and hasattr(col, "type")
             ):
                 coltype = getattr(col.type, "python_type", None)
                 if isinstance(
                     col.type, (satypes.String, satypes.Text, satypes.Unicode)
                 ) or (coltype and coltype is str):
-                    opclass_map[col.name] = "gin_trgm_ops"
-
-    elif getattr(index, "expressions", None):
+                    opclass_map[unqualify(col.name)] = "gin_trgm_ops"
+    # --- Expressions/TextClause ---
+    elif getattr(index, "expressions", None) and len(index.expressions) > 0:
         for expr in index.expressions:
-            expr_str = str(expr).strip()
-            elements.append(f"text({expr_str!r})")
-
-            if (
-                "postgresql" in index.dialect_options
-                and index.dialect_options["postgresql"].get("using") == "gin"
-            ):
+            if isinstance(expr, TextClause):
+                expr_str = str(expr)
+                # GIN/TRGM als Suffix
                 if (
-                    "::tsvector" not in expr_str
-                    and "array" not in expr_str.lower()
-                    and "json" not in expr_str.lower()
+                    "postgresql" in index.dialect_options
+                    and index.dialect_options["postgresql"].get("using") == "gin"
+                    and not expr_str.rstrip().endswith("gin_trgm_ops")
                 ):
-                    opclass_map[expr_str] = "gin_trgm_ops"
-
-    if not elements:
-        print(
-            f"# WARNING: Skipped index {getattr(index, 'name', None)!r} on table {getattr(index.table, 'name', None)!r} (no columns or expressions)."
-        )
-        return ""
-
-    kwargs: dict[str, Any] = {}
+                    expr_str = f"{expr_str} gin_trgm_ops"
+                args.append(f"text({expr_str!r})")
+            else:
+                expr_str = str(expr)
+                m = re.match(r"^upper\(\((\w+)\)::text\)$", expr_str)
+                if (
+                    m
+                    and "postgresql" in index.dialect_options
+                    and index.dialect_options["postgresql"].get("using") == "gin"
+                ):
+                    args.append(f"text('upper(({m.group(1)})::text) gin_trgm_ops')")
+                else:
+                    args.append(f"text({expr_str!r})")
+    else:
+        # Fallback
+        pass
 
     if index.unique:
         kwargs["unique"] = True
@@ -695,11 +756,10 @@ def clx_render_index(self: "TablesGenerator", index: Index) -> str:
             kwargs["postgresql_using"] = (
                 f"'{using}'" if isinstance(using, str) else using
             )
-
         if opclass_map:
             kwargs["postgresql_ops"] = opclass_map
 
-    return render_callable("Index", repr(index.name), *elements, kwargs=kwargs)
+    return render_callable("Index", *args, kwargs=kwargs)
 
 
 TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
@@ -708,9 +768,12 @@ TablesGenerator.render_index = clx_render_index  # type: ignore[method-assign]
 def clx_render_table(self: "TablesGenerator", table: Table) -> str:
     args: list[str] = [f"{table.name!r}, {self.base.metadata_ref}"]
     kwargs: dict[str, object] = {}
+
+    # Columns
     for column in table.columns:
         args.append(self.render_column(column, True, is_table=True))
 
+    # Constraints
     for constraint in sorted(table.constraints, key=get_constraint_sort_key):
         if uses_default_name(constraint):
             if isinstance(constraint, PrimaryKeyConstraint):
@@ -720,18 +783,25 @@ def clx_render_table(self: "TablesGenerator", table: Table) -> str:
                     continue
         args.append(self.render_constraint(constraint))
 
+    # Indices
     for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
-        if len(index.columns) > 1 or not uses_default_name(index):
-            idx_code = self.render_index(index)
-            if idx_code.strip() and idx_code is not None:
-                args.append(idx_code)
+        orig_columns = getattr(index, "columns", [])
+        if orig_columns:
+            table.indexes.remove(index)
+            columns = [table.c[unqualify(col.name)] for col in orig_columns]
+            new_index = Index(index.name, *columns, **index.kwargs)
+            table.append_constraint(new_index)
+        idx_code = self.render_index(index)
+        if idx_code.strip() and idx_code is not None:
+            args.append(idx_code)
 
     if table.schema:
-        kwargs["schema"] = repr(table.schema)
+        kwargs["schema"] = table.schema
 
+    # Table comment
     table_comment = getattr(table, "comment", None)
     if table_comment:
-        kwargs["comment"] = repr(table.comment)
+        kwargs["comment"] = table_comment
 
     return render_callable("Table", *args, kwargs=kwargs, indentation="    ")
 
@@ -911,7 +981,6 @@ def get_table_managed_sequences(metadata: MetaData) -> set[str]:
         for column in table.columns:
             default = getattr(column, "default", None)
             if default is not None:
-                # Sequence kann als Default o. direkt als ServerDefault hinterlegt sein
                 if hasattr(default, "name"):
                     seq_names.add(default.name)
             if hasattr(column, "sequence") and column.sequence is not None:
@@ -935,10 +1004,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
 
         sql = globals()[statement]
         template_def = globals()[template]
-
-        # Hole alle aus DB
         result: list[dict[str, Any]] = fetch_all_mappings(conn, sql, {"schema": schema})
-        # Finde alle, die von Tables verwaltet werden
+
         entities = [
             parsed
             for row in result
@@ -1014,6 +1081,7 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         has_id = False
 
         for col in table.columns:
+            sa_type = sa_type_from_column(col)
             if col.name == "id":
                 has_id = True
 
@@ -1071,11 +1139,11 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                     continue
             args.append(self.render_constraint(constraint))
 
+        # NEU: ALLE Indexe (egal ob "special" oder nicht)
         for index in sorted(table.indexes, key=lambda i: str(i.name or "")):
-            if len(index.columns) > 1 or not uses_default_name(index):
-                idx_code = self.render_index(index)
-                if idx_code.strip() and idx_code is not None:
-                    args.append(idx_code)
+            idx_code = self.render_index(index)
+            if idx_code.strip() and idx_code is not None:
+                args.append(idx_code)
 
         if table.schema:
             kwargs["schema"] = table.schema
@@ -1137,14 +1205,14 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             "ARRAY": ("sqlalchemy", "ARRAY"),
         }
 
-        # Ergänzung: Ermittlung aller Extension-Objekte (Tabellen, Views, etc.)
         def get_extension_object_names(
             conn: Connection, schemas: set[str | None]
         ) -> Any:
             extension_objs = set()
             for schema in schemas:
                 result = conn.execute(
-                    text("""
+                    text(
+                        """
                     SELECT c.relname
                     FROM pg_class c
                     JOIN pg_namespace n ON c.relnamespace = n.oid
@@ -1155,13 +1223,13 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
                         JOIN pg_extension e ON d.refobjid = e.oid
                         WHERE d.objid = c.oid AND d.deptype = 'e'
                     )
-                """),
+                """
+                    ),
                     {"schema": schema},
                 )
                 extension_objs |= {row[0] for row in result}
             return extension_objs
 
-        # Hole nur einmal die Extension-Objekte aus der DB
         conn = self.bind.connect() if hasattr(self.bind, "connect") else self.bind
         EXTENSION_OBJECTS = get_extension_object_names(conn, schemas)
 
@@ -1206,13 +1274,12 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
             schema = table.schema
             schema_views = views_by_schema.get(schema, set())
 
-            # **Hier: Filter für System- und Extension-Objekte**
             if table.schema and table.schema.startswith("pg_"):
-                continue  # Skip Postgres System-Views
+                continue
             if table.name.startswith("pg_"):
-                continue  # Skip system views
+                continue
             if table.name in EXTENSION_OBJECTS:
-                continue  # Skip Extension-Objekte
+                continue
 
             for col in table.columns:
                 sa_type = sa_type_from_column(col)
@@ -1250,6 +1317,8 @@ class DeclarativeGeneratorWithViews(DeclarativeGenerator):
         self.add_literal_import("sqlalchemy", "text")
         self.add_literal_import("sqlalchemy", "FetchedValue")
 
-        return "\n\n".join(rendered), finalize_alembic_utils(
-            pg_alembic_definition, entities, entities_name
-        ) if pg_alembic_definition else None
+        return "\n\n".join(rendered), (
+            finalize_alembic_utils(pg_alembic_definition, entities, entities_name)
+            if pg_alembic_definition
+            else None
+        )

@@ -1225,6 +1225,21 @@ class DeclarativeGenerator(TablesGenerator):
         column = column_attr.column
         rendered_column = self.render_column(column, column_attr.name != column.name)
 
+        is_uuid_pk = (
+            column.primary_key
+            and getattr(column.type, "python_type", None)
+            in (str, bytes)  # meistens str
+            and "Uuid" in str(column.type)
+            and not getattr(column, "default", None)
+            and not getattr(column, "server_default", None)
+        )
+        if is_uuid_pk and "default=uuid4" not in rendered_column:
+            # default=uuid4 in den Column-Aufruf einfügen (vor letztem ")")
+            if rendered_column.endswith(")"):
+                # Einfachstes Pattern: vor ")" einfügen
+                rendered_column = rendered_column[:-1] + ", default=uuid4)"
+                self.add_literal_import("uuid", "uuid4")
+
         def get_type_qualifiers() -> tuple[str, TypeEngine[Any], str]:
             column_type = column.type
             pre: list[str] = []
