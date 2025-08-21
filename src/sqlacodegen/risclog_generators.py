@@ -801,7 +801,7 @@ def clx_render_table(self: "TablesGenerator", table: Table) -> str:
     # Table comment
     table_comment = getattr(table, "comment", None)
     if table_comment:
-        kwargs["comment"] = table_comment
+        kwargs["comment"] = repr(table_comment)
 
     return render_callable("Table", *args, kwargs=kwargs, indentation="    ")
 
