@@ -32,6 +32,7 @@ from sqlacodegen.risclog_generators import (
     parse_policy_row,
     parse_publication_row,
     parse_trigger_row,
+    parse_sequence_row,
 )
 from sqlacodegen.seed_export import export_pgdata_py
 
@@ -253,6 +254,14 @@ def main() -> None:
             "parse_row_func": parse_publication_row,
             "file": "pg_publications.py",
         },
+        {
+            "title": "Sequences",
+            "entities_varname": "all_sequences",
+            "template": "ALEMBIC_SEQUENCE_TEMPLATE",
+            "statement": "ALEMBIC_STANDALONE_SEQUENCE_STATEMENT",
+            "parse_row_func": parse_sequence_row,
+            "file": "pg_sequence.py",
+        },
     ]
 
     # ----------- Export-Loop ------------
@@ -283,7 +292,7 @@ def main() -> None:
                 orm_views, pg_alembic = gen_func(generator_views)  # type: ignore[operator]
                 with open(dest_orm_path, "w", encoding="utf-8") as f:
                     f.write(orm_views)
-                if pg_alembic:    
+                if pg_alembic:
                     with open(dest_pg_path, "w", encoding="utf-8") as f:
                         f.write("\n".join(pg_alembic))
                 print(f"{title} geschrieben nach: {dest_orm_path.as_posix()}")
