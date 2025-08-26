@@ -239,32 +239,45 @@ WHERE nspname != 'pg_catalog'
 ORDER BY extname;
 """
 
-ALEMBIC_SEQUENCE_STATEMENT = """
+ALEMBIC_STANDALONE_SEQUENCE_STATEMENT = """
+WITH seqs AS (
+  SELECT c.oid AS seq_oid,
+         n.nspname AS schema,
+         c.relname AS sequence_name
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.relkind = 'S'
+    AND n.nspname NOT IN ('pg_catalog','information_schema')
+    AND n.nspname NOT LIKE 'pg_toast%'
+    AND n.nspname NOT LIKE 'pg_temp_%'
+)
 SELECT
-    s.sequence_schema AS schema,
-    s.sequence_name,
-    s.data_type,
-    s.start_value,
-    s.minimum_value,
-    s.maximum_value,
-    s.increment,
-    s.cycle_option AS cycle,
-    ps.cache_size
-FROM information_schema.sequences s
+  s.schema,
+  s.sequence_name,
+  ps.data_type,
+  ps.start_value,
+  ps.min_value     AS minimum_value,
+  ps.max_value     AS maximum_value,
+  ps.increment_by  AS increment,
+  ps.cycle,
+  ps.cache_size
+FROM seqs s
 JOIN pg_catalog.pg_sequences ps
-      ON s.sequence_schema = ps.schemaname
-     AND s.sequence_name = ps.sequencename
-JOIN pg_class t
-    ON t.relkind = 'r' AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.sequence_schema)
-JOIN pg_attribute a
-    ON a.attrelid = t.oid
-JOIN pg_attrdef d
-    ON d.adrelid = t.oid AND d.adnum = a.attnum
-WHERE
-    s.sequence_schema NOT IN ('pg_catalog', 'information_schema')
-    AND pg_get_expr(d.adbin, d.adrelid) LIKE '%nextval(%' || s.sequence_name || '%'
-ORDER BY s.sequence_schema, s.sequence_name;
+  ON ps.schemaname   = s.schema
+ AND ps.sequencename = s.sequence_name
+LEFT JOIN pg_depend owned
+       ON owned.classid = 'pg_class'::regclass
+      AND owned.objid   = s.seq_oid
+      AND owned.deptype IN ('a','i')   -- serial/identity ownership
+LEFT JOIN pg_depend used
+       ON used.refclassid = 'pg_class'::regclass
+      AND used.refobjid   = s.seq_oid
+      AND used.classid    = 'pg_attrdef'::regclass  -- used in a column DEFAULT
+WHERE owned.objid IS NULL
+  AND used.objid  IS NULL
+ORDER BY s.schema, s.sequence_name;
 """
+
 
 
 def parse_publication_row(
